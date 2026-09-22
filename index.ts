@@ -2,8 +2,10 @@
  * Guardian extension for pi - LLM auto-approval of risky tool calls.
  *
  * Port of the OpenAI Codex "guardian" auto-review design (Apache-2.0,
- * github.com/openai/codex, codex-rs/core/src/guardian/) onto pi's extension
- * API. Layering mirrors Codex:
+ * github.com/openai/codex: codex-rs/core/src/guardian/ for request assembly,
+ * codex-rs/guardian-context/ for transcript budgeting, codex-rs/ext/guardian-
+ * reviewer/ for the review lifecycle, codex-rs/prompts/templates/guardian/ for
+ * the prompts) onto pi's extension API. Layering mirrors Codex:
  *
  *   1. Static gates: read-only tools and an allowlist of safe bash commands
  *      run without review; writes/edits inside the workspace run without

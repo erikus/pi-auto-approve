@@ -3,6 +3,8 @@
 An LLM auto-approval "guardian" for the [pi coding agent](https://pi.dev), ported from
 OpenAI Codex's guardian auto-review system
 ([`codex-rs/core/src/guardian/`](https://github.com/openai/codex/tree/main/codex-rs/core/src/guardian),
+[`codex-rs/guardian-context/`](https://github.com/openai/codex/tree/main/codex-rs/guardian-context),
+[`codex-rs/ext/guardian-reviewer/`](https://github.com/openai/codex/tree/main/codex-rs/ext/guardian-reviewer),
 Apache-2.0). Instead of prompting you for every risky tool call - or running with no
 gate at all (pi ships without a permission system) - a reviewer model judges each
 risky action against a written policy and allows or denies it automatically.
@@ -110,8 +112,8 @@ node --experimental-strip-types smoke-test.ts # static-gate + parser tests
 The extension code is MIT licensed (see `LICENSE`).
 
 `policy/policy_template.md` and `policy/policy.md` are copied from
-[openai/codex](https://github.com/openai/codex) (`codex-rs/core/src/guardian/`),
+[openai/codex](https://github.com/openai/codex) (`codex-rs/prompts/templates/guardian/`),
 licensed under Apache-2.0 (see `policy/LICENSE`; `policy/NOTICE` reproduces the
 upstream attribution notice as Apache-2.0 requires). The extension code is a re-implementation of that design
 for pi's extension API; constants (timeout, retry count, breaker thresholds, transcript
-caps) mirror `codex-rs/core/src/guardian/mod.rs`.
+caps) mirror `codex-rs/ext/guardian-reviewer/` and `codex-rs/guardian-context/`.
