@@ -24,8 +24,9 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
-// Configuration constants (mirroring codex-rs/core/src/guardian/mod.rs; token
-// limits converted to chars at ~4 chars/token)
+// Configuration constants (mirroring codex-rs/guardian-context/src/profile.rs
+// and codex-rs/core/src/guardian/request_budget.rs; token limits converted to
+// chars at CHARS_PER_TOKEN)
 // ---------------------------------------------------------------------------
 
 const GUARDIAN_PROVIDER = "anthropic";
@@ -37,13 +38,25 @@ const MAX_CONSECUTIVE_DENIALS_PER_TURN = 3;
 const DENIAL_WINDOW_SIZE = 50;
 const MAX_WINDOW_DENIALS = 10;
 
+const CHARS_PER_TOKEN = 4;
+// Per-kind transcript retention. User messages are never capped or dropped
+// here; they count against the message budget and are shortened only as a last
+// resort by the whole-request budget below.
 const MAX_RECENT_NON_USER_ENTRIES = 40;
-const MAX_MESSAGE_TRANSCRIPT_CHARS = 80_000;
-const MAX_TOOL_TRANSCRIPT_CHARS = 40_000;
-const MAX_CHARS_PER_MESSAGE = 20_000;
-const MAX_CHARS_PER_TOOL_ENTRY = 4_000;
-const MAX_ACTION_STRING_CHARS = 64_000;
-const MAX_FORMATTED_ACTION_CHARS = 64_000;
+const MAX_MESSAGE_TRANSCRIPT_CHARS = 20_000 * CHARS_PER_TOKEN;
+const MAX_TOOL_TRANSCRIPT_CHARS = 10_000 * CHARS_PER_TOKEN;
+const MAX_CHARS_PER_MESSAGE = 5_000 * CHARS_PER_TOKEN;
+const MAX_CHARS_PER_TOOL_ENTRY = 1_000 * CHARS_PER_TOKEN;
+/** The newest tool entries survive whole-request eviction. */
+const MIN_RECENT_TOOL_ENTRIES = 5;
+// Whole-request budget: the reviewer model's context window less a reply
+// margin. The planned action is always sent complete; if it cannot fit beside
+// the policy and the minimum evidence, the review fails rather than reviewing
+// a shortened action.
+const DEFAULT_MAX_INPUT_TOKENS = 128_000;
+const INPUT_TOKEN_MARGIN = 256;
+/** Floor when shortening a user message to make room (upstream: 32 tokens). */
+const MIN_HISTORICAL_ENTRY_CHARS = 32 * CHARS_PER_TOKEN;
 
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const WORKSPACE_WRITE_TOOLS = new Set(["write", "edit"]);
@@ -158,9 +171,20 @@ export function renderPolicyInstructions(template: string, tenantPolicy: string,
 		.join(tenantPolicy.trim());
 }
 
-function truncate(text: string, maxChars: number): string {
+/**
+ * Shorten text to `maxChars`, keeping both ends around a marker so the start
+ * (label, intent) and end (latest content) both survive. Mirrors
+ * codex-rs/guardian-context/src/truncation.rs.
+ */
+export function truncate(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars)}\n<guardian_truncated original_chars="${text.length}"/>`;
+	const omittedTokens = Math.ceil((text.length - maxChars) / CHARS_PER_TOKEN);
+	const marker = `<truncated omitted_approx_tokens="${omittedTokens}" />`;
+	if (maxChars <= marker.length) return marker;
+	const available = maxChars - marker.length;
+	const prefix = Math.floor(available / 2);
+	const suffix = available - prefix;
+	return `${text.slice(0, prefix)}${marker}${text.slice(text.length - suffix)}`;
 }
 
 interface SessionContentBlock {
@@ -201,8 +225,13 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
 				.join("\n")
 				.trim();
 			if (text) {
-				const label = message.role === "user" ? "User" : "Assistant";
-				sections.push({ kind: message.role, text: `${label}: ${truncate(text, MAX_CHARS_PER_MESSAGE)}` });
+				// Only assistant text gets a per-entry cap; user text is authorization
+				// evidence and is kept complete at this stage.
+				if (message.role === "user") {
+					sections.push({ kind: "user", text: `User: ${text}` });
+				} else {
+					sections.push({ kind: "assistant", text: `Assistant: ${truncate(text, MAX_CHARS_PER_MESSAGE)}` });
+				}
 			}
 			if (message.role === "assistant") {
 				for (const b of blocks) {
@@ -232,38 +261,45 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
 }
 
 /**
- * Compact transcript with separate message/tool budgets. User messages are
- * selected first so tool traffic cannot evict authorization evidence. If they
- * do not all fit, keep the first user message as an intent anchor and fill the
- * remaining budget with the newest user messages.
+ * How an item behaves under the whole-request budget (mirrors
+ * codex-rs/guardian-context/src/enforcement.rs):
+ *   required   - never shortened or dropped (policy, planned action, newest tools)
+ *   historical - user messages: kept complete unless nothing else can make room,
+ *                then shortened oldest-first with both ends preserved
+ *   optional   - evicted first, lowest priority and oldest first
  */
-export function buildTranscript(ctx: ExtensionContext): string {
-	const entries = collectTranscriptEntries(ctx);
-	if (entries.length === 0) return "<no retained transcript entries>";
+type Retention = "required" | "historical" | { optional: BudgetPriority };
+type BudgetPriority = "commentary" | "tool";
+/** Eviction order: lower goes first. */
+const BUDGET_PRIORITY_ORDER: Record<BudgetPriority, number> = { commentary: 0, tool: 1 };
 
-	const included = new Set<number>();
-	const userIndices = entries
-		.map((entry, index) => (entry.kind === "user" ? index : -1))
-		.filter((index) => index >= 0);
-	const allUserChars = userIndices.reduce((total, index) => total + entries[index]!.text.length, 0);
+export interface BudgetedItem {
+	text: string;
+	retention: Retention;
+}
+
+export interface SelectedTranscript {
+	items: BudgetedItem[];
+	/** Entries dropped by per-kind retention before the whole-request budget. */
+	omitted: number;
+}
+
+/**
+ * Per-kind transcript retention (codex-rs/guardian-context/src/profile.rs,
+ * synchronous profile). Every user message is included so tool traffic can
+ * never evict authorization evidence; user text still counts against the
+ * message budget, so it crowds out assistant commentary rather than the
+ * reverse. Non-user entries are kept newest-first within their budget.
+ */
+export function selectTranscript(entries: TranscriptEntry[]): SelectedTranscript {
+	const included: boolean[] = entries.map(() => false);
 	let messageChars = 0;
-
-	if (allUserChars <= MAX_MESSAGE_TRANSCRIPT_CHARS) {
-		for (const index of userIndices) included.add(index);
-		messageChars = allUserChars;
-	} else if (userIndices.length > 0) {
-		const first = userIndices[0]!;
-		included.add(first);
-		messageChars = entries[first]!.text.length;
-		for (let i = userIndices.length - 1; i > 0; i--) {
-			const index = userIndices[i]!;
-			const chars = entries[index]!.text.length;
-			if (messageChars + chars <= MAX_MESSAGE_TRANSCRIPT_CHARS) {
-				included.add(index);
-				messageChars += chars;
-			}
+	entries.forEach((entry, index) => {
+		if (entry.kind === "user") {
+			included[index] = true;
+			messageChars += entry.text.length;
 		}
-	}
+	});
 
 	let toolChars = 0;
 	let retainedNonUserEntries = 0;
@@ -278,83 +314,174 @@ export function buildTranscript(ctx: ExtensionContext): string {
 			if (messageChars + chars > MAX_MESSAGE_TRANSCRIPT_CHARS) continue;
 			messageChars += chars;
 		}
-		included.add(index);
+		included[index] = true;
 		retainedNonUserEntries += 1;
 	}
 
-	const selected = entries.filter((_entry, index) => included.has(index)).map((entry) => entry.text);
-	const omitted = entries.length - selected.length;
-	if (omitted > 0) selected.push(`<guardian_truncated omitted_transcript_entries="${omitted}"/>`);
-	return selected.join("\n\n");
-}
-
-export interface FormattedPlannedAction {
-	text: string;
-	complete: boolean;
-	truncatedFields: string[];
-}
-
-function truncateActionValue(
-	value: unknown,
-	path: string,
-	truncatedFields: string[],
-	ancestors: WeakSet<object>,
-): unknown {
-	if (typeof value === "string") {
-		if (value.length <= MAX_ACTION_STRING_CHARS) return value;
-		truncatedFields.push(path);
-		return truncate(value, MAX_ACTION_STRING_CHARS);
+	const items: BudgetedItem[] = [];
+	entries.forEach((entry, index) => {
+		if (!included[index]) return;
+		const retention: Retention =
+			entry.kind === "user" ? "historical" : { optional: entry.kind === "tool" ? "tool" : "commentary" };
+		items.push({ text: entry.text, retention });
+	});
+	// Keep the newest tool evidence even when the aggregate allowance is tight.
+	let protectedTools = 0;
+	for (let index = items.length - 1; index >= 0 && protectedTools < MIN_RECENT_TOOL_ENTRIES; index--) {
+		const item = items[index]!;
+		if (typeof item.retention === "object" && item.retention.optional === "tool") {
+			item.retention = "required";
+			protectedTools += 1;
+		}
 	}
+	return { items, omitted: entries.length - items.length };
+}
+
+function renderTranscript(selected: SelectedTranscript): string {
+	if (selected.items.length === 0 && selected.omitted === 0) return "<no retained transcript entries>";
+	const lines = selected.items.map((item) => item.text);
+	if (selected.omitted > 0) lines.push(`<guardian_truncated omitted_transcript_entries="${selected.omitted}"/>`);
+	return lines.join("\n\n");
+}
+
+/** Per-kind retention only; the whole-request budget is applied in composeReviewPrompt. */
+export function buildTranscript(ctx: ExtensionContext): string {
+	return renderTranscript(selectTranscript(collectTranscriptEntries(ctx)));
+}
+
+function sortActionValue(value: unknown, path: string, ancestors: WeakSet<object>): unknown {
 	if (!value || typeof value !== "object") return value;
 	if (ancestors.has(value)) throw new TypeError(`planned action contains a circular value at ${path}`);
 	ancestors.add(value);
 	try {
 		if (Array.isArray(value)) {
-			return value.map((item, index) => truncateActionValue(item, `${path}[${index}]`, truncatedFields, ancestors));
+			return value.map((item, index) => sortActionValue(item, `${path}[${index}]`, ancestors));
 		}
 		return Object.fromEntries(
 			Object.entries(value as Record<string, unknown>)
 				.sort(([left], [right]) => left.localeCompare(right))
-				.map(([key, item]) => [
-					key,
-					truncateActionValue(item, path ? `${path}.${key}` : key, truncatedFields, ancestors),
-				]),
+				.map(([key, item]) => [key, sortActionValue(item, path ? `${path}.${key}` : key, ancestors)]),
 		);
 	} finally {
 		ancestors.delete(value);
 	}
 }
 
-/** Format an action as valid JSON and report whether every executable byte is represented. */
-export function formatPlannedAction(toolName: string, input: unknown): FormattedPlannedAction {
-	const truncatedFields: string[] = [];
-	const value = truncateActionValue(
-		{ input, tool: toolName, working_directory: process.cwd() },
-		"",
-		truncatedFields,
-		new WeakSet(),
-	);
-	const text = JSON.stringify(value, null, 2);
-	if (text.length > MAX_FORMATTED_ACTION_CHARS) truncatedFields.push("<formatted action>");
-	return { text, complete: truncatedFields.length === 0, truncatedFields };
+/**
+ * Format the complete action as sorted JSON. Nothing is ever shortened here:
+ * the reviewer must see every executable byte, so an action that does not fit
+ * the request budget fails the review instead.
+ */
+export function formatPlannedAction(toolName: string, input: unknown): string {
+	const action = { input, tool: toolName, working_directory: process.cwd() };
+	return JSON.stringify(sortActionValue(action, "", new WeakSet()), null, 2);
 }
 
-function buildReviewPrompt(ctx: ExtensionContext, toolName: string, input: unknown): string {
-	const action = formatPlannedAction(toolName, input);
-	if (!action.complete) {
-		throw new Error(
-			`planned action exceeds the safe review limit (${action.truncatedFields.slice(0, 5).join(", ")}); refusing to review a shortened action`,
-		);
+export class GuardianInputBudgetError extends Error {
+	constructor() {
+		super("the complete action and minimum review context exceed the reviewer input budget");
+		this.name = "GuardianInputBudgetError";
 	}
+}
+
+const CONTEXT_OMISSION_NOTICE =
+	"<guardian_context_omission>\n" +
+	"Conversation evidence was omitted or shortened to fit the review input budget. " +
+	"User instructions and prior approvals may be incomplete where marked. " +
+	"Do not infer authorization from missing evidence or treat a partial grant as overriding an omitted restriction.\n" +
+	"</guardian_context_omission>";
+
+const SECTION_SEPARATOR = "\n\n";
+
+export interface ReviewPromptParts {
+	/** Policy instructions and output contract (required). */
+	instructions: string;
+	transcript: SelectedTranscript;
+	/** Complete planned action JSON (required). */
+	action: string;
+	maxInputTokens: number;
+}
+
+/**
+ * Fit the review request into the reviewer's input budget
+ * (codex-rs/guardian-context/src/enforcement.rs). Required content is never
+ * touched. If the rest does not fit: shorten user messages oldest-first only
+ * when required content alone overflows, then evict optional evidence lowest
+ * priority and oldest first, and add an omission notice. Throws
+ * GuardianInputBudgetError when the required content cannot fit at all.
+ */
+export function composeReviewPrompt(parts: ReviewPromptParts): string {
+	const budgetChars = Math.max(0, parts.maxInputTokens - INPUT_TOKEN_MARGIN) * CHARS_PER_TOKEN;
+	const items = parts.transcript.items.map((item) => ({ ...item }));
+	const render = (kept: BudgetedItem[], omitted: number, notice: string) =>
+		[
+			parts.instructions,
+			...(notice ? [notice] : []),
+			"# Transcript (untrusted evidence)",
+			`<transcript>\n${renderTranscript({ items: kept, omitted })}\n</transcript>`,
+			"# Planned Action (untrusted evidence)",
+			`<planned_action>\n${parts.action}\n</planned_action>`,
+		].join(SECTION_SEPARATOR);
+
+	const complete = render(items, parts.transcript.omitted, "");
+	if (complete.length <= budgetChars) return complete;
+
+	const notice = CONTEXT_OMISSION_NOTICE;
+	const itemChars = (item: BudgetedItem) => item.text.length + SECTION_SEPARATOR.length;
+	const isOptional = (item: BudgetedItem) => typeof item.retention === "object";
+	let requiredChars = render(items.filter((item) => !isOptional(item)), parts.transcript.omitted, notice).length;
+	let historyShortened = false;
+
+	// Historical (user) entries yield oldest-first, only when required content
+	// alone overflows. Both ends and the label survive around the marker.
+	for (const item of items) {
+		if (requiredChars <= budgetChars) break;
+		if (item.retention !== "historical") continue;
+		const target = Math.max(MIN_HISTORICAL_ENTRY_CHARS, item.text.length - (requiredChars - budgetChars));
+		const shortened = truncate(item.text, target);
+		if (shortened.length >= item.text.length) continue;
+		requiredChars -= item.text.length - shortened.length;
+		item.text = shortened;
+		historyShortened = true;
+	}
+	if (requiredChars > budgetChars) throw new GuardianInputBudgetError();
+
+	// Optional evidence that cannot fit beside the required content leaves
+	// first; then evict lowest priority, oldest first, until within budget.
+	const optionalAllowance = budgetChars - requiredChars;
+	const removed = new Set<number>();
+	const candidates: Array<{ order: number; index: number }> = [];
+	items.forEach((item, index) => {
+		if (typeof item.retention !== "object") return;
+		if (itemChars(item) > optionalAllowance) removed.add(index);
+		else candidates.push({ order: BUDGET_PRIORITY_ORDER[item.retention.optional], index });
+	});
+	candidates.sort((a, b) => a.order - b.order || a.index - b.index);
+	const renderKept = () =>
+		render(
+			items.filter((_item, index) => !removed.has(index)),
+			parts.transcript.omitted + removed.size,
+			notice,
+		);
+	let prompt = renderKept();
+	for (const candidate of candidates) {
+		if (prompt.length <= budgetChars) break;
+		removed.add(candidate.index);
+		prompt = renderKept();
+	}
+	if (removed.size === 0 && !historyShortened) throw new GuardianInputBudgetError();
+	if (prompt.length > budgetChars) throw new GuardianInputBudgetError();
+	return prompt;
+}
+
+function buildReviewPrompt(ctx: ExtensionContext, toolName: string, input: unknown, maxInputTokens: number): string {
 	const instructions = renderPolicyInstructions(loadPolicyTemplate(), loadTenantPolicy(), loadExtraPolicy());
-	return [
-		instructions.trim(),
-		OUTPUT_CONTRACT.trim(),
-		"# Transcript (untrusted evidence)",
-		`<transcript>\n${buildTranscript(ctx)}\n</transcript>`,
-		"# Planned Action (untrusted evidence)",
-		`<planned_action>\n${action.text}\n</planned_action>`,
-	].join("\n\n");
+	return composeReviewPrompt({
+		instructions: `${instructions.trim()}${SECTION_SEPARATOR}${OUTPUT_CONTRACT.trim()}`,
+		transcript: selectTranscript(collectTranscriptEntries(ctx)),
+		action: formatPlannedAction(toolName, input),
+		maxInputTokens,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +725,10 @@ export default function guardianExtension(pi: ExtensionAPI) {
 	): Promise<GuardianAssessment> {
 		const model = resolveGuardianModel(ctx);
 		if (!model) throw new Error("no guardian model with configured auth");
-		const prompt = buildReviewPrompt(ctx, toolName, input);
+		// Codex additionally scales by the model's effective context-window
+		// percent; pi has no such field, so the full window applies.
+		const maxInputTokens = model.contextWindow > 0 ? model.contextWindow : DEFAULT_MAX_INPUT_TOKENS;
+		const prompt = buildReviewPrompt(ctx, toolName, input, maxInputTokens);
 		const messages = [
 			{
 				role: "user" as const,

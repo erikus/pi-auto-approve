@@ -34,9 +34,12 @@ For local development, clone the repo and run `pi -e ./index.ts` from the checko
    - `bash` commands made only of allowlisted read-only segments (`ls`, `cat`, `git status`,
      `grep`, …, no redirection/substitution) run freely.
 2. **Guardian review** for everything else: the extension builds a compact transcript
-   with user intent retained separately from recent assistant/tool evidence (capped,
+   (every user message, plus recent assistant/tool evidence that is capped,
    truncation-tagged, and treated according to the policy's trust rules), renders the
-   exact planned action, and asks the reviewer model for a strict-JSON verdict
+   complete planned action, fits the request into the reviewer model's context window
+   (optional evidence is evicted first, user messages are shortened only as a last
+   resort, and an omission notice tells the reviewer not to infer authorization from
+   missing evidence), and asks for a strict-JSON verdict
    `{risk_level, user_authorization, outcome, rationale}` per the policy prompt.
 3. **Deny** blocks the tool call with instructions to the agent not to work around the
    denial (mirroring Codex). In the TUI you get an "Allow anyway?" override prompt - a manual approval is final, like Codex's post-denial user approval.
@@ -44,8 +47,9 @@ For local development, clone the repo and run `pi -e ./index.ts` from the checko
    verdict, oversized action, or no authenticated model never silently allows - with a
    UI you're prompted; headless, the action is blocked. Parse errors and transient
    service/network failures retry up to three total attempts with backoff; permanent
-   failures do not retry. Oversized executable fields are never shortened for model
-   review and then run in full.
+   failures do not retry. The planned action is never shortened for model review and
+   then run in full: if it cannot fit the reviewer's window beside the policy and the
+   minimum evidence, the review fails.
 5. **Circuit breaker**: 3 consecutive denials in a turn or 10 denials in the last 50
    reviews pauses auto-review; gated actions fall back to manual prompts
    (the same shape as Claude Code's auto-mode breaker).
@@ -83,9 +87,11 @@ actions are denied; and high-risk actions need at least `medium` user authorizat
   an `rm -rf` target) before deciding; this prototype judges from the transcript alone
   and the output contract tells it to lean conservative when facts are unverifiable.
 - **Single-completion review**, no prewarmed review session.
-- **Char-based caps** (~4 chars/token) instead of Codex's tokenizer-based transcript caps;
-  like Codex, message and tool evidence have separate budgets and the first/newest user
-  messages are retained before recent non-user evidence.
+- **Char-based caps** (~4 chars/token) instead of Codex's tokenizer-based transcript and
+  request budgets; like Codex, message and tool evidence have separate budgets, all user
+  messages are retained before recent non-user evidence, and the whole request is fitted
+  to the reviewer model's context window. Codex additionally scales that window by a
+  per-model percentage that pi does not expose.
 - The static safe-command check is a much smaller allowlist than Codex's
   `is_safe_command` parser - anything it can't prove safe just goes to review, so
   being conservative here only costs latency, not safety.

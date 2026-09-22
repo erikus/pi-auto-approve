@@ -8,7 +8,7 @@ import guardianExtension, { GuardianReviewTimeoutError } from "./index.ts";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<{ block: boolean; reason?: string } | undefined>;
 
-function makeHarness(completeImpl: () => Promise<string>) {
+function makeHarness(completeImpl: () => Promise<string>, options: { contextWindow?: number } = {}) {
 	const handlers = new Map<string, Handler>();
 	const fakePi = {
 		on: (name: string, handler: Handler) => handlers.set(name, handler),
@@ -16,7 +16,7 @@ function makeHarness(completeImpl: () => Promise<string>) {
 	};
 	guardianExtension(fakePi as never);
 
-	const model = { id: "mock-model", provider: "mock" };
+	const model = { id: "mock-model", provider: "mock", contextWindow: options.contextWindow };
 	const ctx = {
 		hasUI: false,
 		ui: undefined,
@@ -141,17 +141,35 @@ function makeHarness(completeImpl: () => Promise<string>) {
 	assert.equal(calls, 2, "transient failures should retry");
 }
 
-// Oversized executable input is never shortened for review and then run in full.
+// An action that cannot fit the reviewer's window is never shortened for review
+// and then run in full: the review fails closed without reaching the model.
 {
 	let calls = 0;
-	const h = makeHarness(async () => {
-		calls++;
-		return '{"outcome":"allow"}';
-	});
+	const h = makeHarness(
+		async () => {
+			calls++;
+			return '{"outcome":"allow"}';
+		},
+		{ contextWindow: 8_000 },
+	);
 	const result = await h.review({ command: `${"x".repeat(64_001)}; rm -rf /` });
 	assert.ok(result?.block, "oversized action must block");
-	assert.match(result.reason ?? "", /refusing to review a shortened action/);
+	assert.match(result.reason ?? "", /exceed the reviewer input budget/);
 	assert.equal(calls, 0, "oversized action must not reach the reviewer model");
+}
+
+// The same action fits a larger window and is reviewed complete.
+{
+	let calls = 0;
+	const h = makeHarness(
+		async () => {
+			calls++;
+			return '{"outcome":"allow"}';
+		},
+		{ contextWindow: 200_000 },
+	);
+	assert.equal(await h.review({ command: `${"x".repeat(64_001)}; echo ok` }), undefined);
+	assert.equal(calls, 1);
 }
 
 // Circuit breaker: 3 consecutive denials trip it; later reviews skip the model.

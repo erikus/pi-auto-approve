@@ -2,11 +2,15 @@
 import assert from "node:assert/strict";
 import {
 	buildTranscript,
+	composeReviewPrompt,
 	formatPlannedAction,
+	GuardianInputBudgetError,
 	isSafeBashCommand,
 	parseVerdict,
 	passesStaticGates,
 	renderPolicyInstructions,
+	type SelectedTranscript,
+	truncate,
 	withReviewDeadline,
 } from "./index.ts";
 import { readFileSync } from "node:fs";
@@ -63,20 +67,80 @@ assert.equal(
 assert.equal(parseVerdict('{"outcome":"maybe"}'), undefined);
 assert.equal(parseVerdict("I think this is fine."), undefined);
 
-// Planned actions remain valid structured JSON, and oversized executable fields are flagged.
+// Planned actions are complete, sorted JSON; nothing is ever shortened.
 {
-	const formatted = formatPlannedAction("bash", { command: "echo ok", timeout: 1000 });
-	assert.equal(formatted.complete, true);
-	assert.deepEqual(JSON.parse(formatted.text), {
+	const formatted = formatPlannedAction("bash", { timeout: 1000, command: "echo ok" });
+	assert.deepEqual(JSON.parse(formatted), {
 		input: { command: "echo ok", timeout: 1000 },
 		tool: "bash",
 		working_directory: process.cwd(),
 	});
+	assert.match(formatted, /"command"[\s\S]*"timeout"/, "keys are sorted");
 
-	const oversized = formatPlannedAction("bash", { command: `${"x".repeat(64_001)}; rm -rf /` });
-	assert.equal(oversized.complete, false);
-	assert.deepEqual(oversized.truncatedFields, ["input.command", "<formatted action>"]);
-	assert.doesNotThrow(() => JSON.parse(oversized.text));
+	const huge = `${"x".repeat(200_000)}; rm -rf /`;
+	assert.ok(formatPlannedAction("bash", { command: huge }).includes(huge), "every executable byte is present");
+}
+
+// Both ends of a shortened entry survive around the marker.
+{
+	const text = `START${"m".repeat(1_000)}END`;
+	const shortened = truncate(text, 200);
+	assert.ok(shortened.length <= 200);
+	assert.match(shortened, /^START/);
+	assert.match(shortened, /END$/);
+	assert.match(shortened, /<truncated omitted_approx_tokens="\d+" \/>/);
+	assert.equal(truncate("short", 200), "short");
+}
+
+// Whole-request budget: required content is never touched, optional evidence is
+// evicted lowest-priority and oldest first, and an omission notice is added.
+{
+	const transcript: SelectedTranscript = {
+		items: [
+			{ text: "User: do the thing", retention: "historical" },
+			{ text: `Assistant: ${"a".repeat(2_000)}`, retention: { optional: "commentary" } },
+			{ text: `Tool result from bash: ${"t".repeat(2_000)}`, retention: { optional: "tool" } },
+			{ text: "Assistant: newest commentary", retention: { optional: "commentary" } },
+			{ text: "Tool result from bash: newest tool", retention: "required" },
+		],
+		omitted: 0,
+	};
+	const parts = { instructions: "POLICY", action: '{"tool":"bash"}', transcript };
+
+	// Fits: no notice, everything present.
+	const fits = composeReviewPrompt({ ...parts, maxInputTokens: 10_000 });
+	assert.doesNotMatch(fits, /guardian_context_omission/);
+	assert.match(fits, /aaaa/);
+
+	// Over budget by ~one large entry: oldest commentary goes first, tool evidence stays.
+	// Budget = (1_100 - 256) * 4 = 3_376 chars; content is ~4_100 chars plus framing.
+	const trimmed = composeReviewPrompt({ ...parts, maxInputTokens: 1_100 });
+	assert.match(trimmed, /guardian_context_omission/);
+	assert.match(trimmed, /User: do the thing/, "user message is kept complete");
+	assert.doesNotMatch(trimmed, /aaaa/, "oldest commentary evicted first");
+	assert.match(trimmed, /tttt/, "tool evidence outranks commentary");
+	assert.match(trimmed, /newest tool/, "required tool entry survives");
+	assert.match(trimmed, /omitted_transcript_entries="1"/);
+
+	// Only required + historical fit: user message is shortened, both ends kept.
+	const longUser: SelectedTranscript = {
+		items: [
+			{ text: `User: FIRST ${"u".repeat(3_000)} LAST`, retention: "historical" },
+			{ text: "Tool result from bash: newest tool", retention: "required" },
+		],
+		omitted: 0,
+	};
+	const shortened = composeReviewPrompt({ ...parts, transcript: longUser, maxInputTokens: 600 });
+	assert.match(shortened, /User: FIRST/);
+	assert.match(shortened, /LAST/);
+	assert.match(shortened, /omitted_approx_tokens/);
+	assert.match(shortened, /guardian_context_omission/);
+
+	// The complete action cannot fit even with nothing else: fail, never shorten.
+	assert.throws(
+		() => composeReviewPrompt({ ...parts, action: "x".repeat(5_000), maxInputTokens: 1_000 }),
+		GuardianInputBudgetError,
+	);
 }
 
 // The shared review deadline aborts in-flight work as well as rejecting the caller.
@@ -117,6 +181,27 @@ assert.equal(parseVerdict("I think this is fine."), undefined);
 	assert.match(transcript, /assistant message 44/);
 	assert.doesNotMatch(transcript, /assistant message 0(?:\D|$)/);
 	assert.match(transcript, /omitted_transcript_entries="5"/);
+}
+
+// User messages are never dropped by per-kind retention, even past the message budget.
+{
+	const messages = [
+		{ role: "user", content: [{ type: "text", text: `first ${"u".repeat(30_000)}` }] },
+		{ role: "user", content: [{ type: "text", text: `middle ${"u".repeat(30_000)}` }] },
+		{ role: "assistant", content: [{ type: "text", text: "assistant reply" }] },
+		{ role: "user", content: [{ type: "text", text: `last ${"u".repeat(30_000)}` }] },
+	];
+	const transcript = buildTranscript({
+		sessionManager: {
+			getBranch: () => messages.map((message) => ({ type: "message", message })),
+		},
+	} as never);
+	assert.match(transcript, /User: first/);
+	assert.match(transcript, /User: middle/);
+	assert.match(transcript, /User: last/);
+	assert.doesNotMatch(transcript, /omitted_approx_tokens/, "user text is not capped per entry");
+	assert.doesNotMatch(transcript, /assistant reply/, "user text consumes the message budget first");
+	assert.match(transcript, /omitted_transcript_entries="1"/);
 }
 
 // Tool evidence has its own budget and cannot crowd out user authorization.
