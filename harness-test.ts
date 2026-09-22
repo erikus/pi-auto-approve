@@ -4,7 +4,7 @@
  * live API. Run: node --experimental-strip-types harness-test.ts
  */
 import assert from "node:assert/strict";
-import guardianExtension from "./index.ts";
+import guardianExtension, { GuardianReviewTimeoutError } from "./index.ts";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<{ block: boolean; reason?: string } | undefined>;
 
@@ -82,8 +82,35 @@ function makeHarness(completeImpl: () => Promise<string>) {
 	});
 	const result = await h.review();
 	assert.ok(result?.block, "failure must block");
-	assert.match(result.reason ?? "", /fail closed/);
+	assert.match(result.reason ?? "", /Automatic approval review failed: invalid API key/);
+	assert.match(result.reason ?? "", /review failure, not a determination that the action is unsafe/);
+	assert.doesNotMatch(result.reason ?? "", /risk:/, "a failed review must not report a risk finding");
 	assert.equal(calls, 1, "permanent failures must not retry");
+}
+
+// 409 conflicts are not transient (Codex retries only 408/429/5xx by status).
+{
+	let calls = 0;
+	const h = makeHarness(async () => {
+		calls++;
+		const error = new Error("conflict") as Error & { status: number };
+		error.status = 409;
+		throw error;
+	});
+	const result = await h.review();
+	assert.ok(result?.block, "409 must fail closed");
+	assert.equal(calls, 1, "409 must not retry");
+}
+
+// Timeout -> distinct instructions that permit one agent retry.
+{
+	const h = makeHarness(async () => {
+		throw new GuardianReviewTimeoutError(90_000);
+	});
+	const result = await h.review();
+	assert.ok(result?.block, "timeout must block");
+	assert.match(result.reason ?? "", /timed out while evaluating/);
+	assert.match(result.reason ?? "", /You may retry once/);
 }
 
 // Unparseable verdict -> retry, then fail closed.

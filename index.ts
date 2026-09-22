@@ -76,6 +76,19 @@ Your entire reply must be a single strict JSON object of the form:
 Only "outcome" is required; for clearly low-risk actions you may reply {"outcome": "allow"}.
 Do not wrap the JSON in markdown fences or add any other text.`;
 
+// Agent-facing text for reviews that never produced an assessment (mirrors
+// codex-rs/ext/guardian-reviewer/src/completion.rs and
+// codex-rs/prompts/src/model_messages/guardian.rs). A failed review is still
+// denied, but it must not be reported as a finding that the action is unsafe.
+const REVIEW_FAILURE_INSTRUCTIONS =
+	"The action was not executed because automatic approval review could not be completed. " +
+	"This is a review failure, not a determination that the action is unsafe. " +
+	"Do not bypass the approval check; resolve the error or ask the user for guidance.";
+const TIMEOUT_INSTRUCTIONS =
+	"The automatic permission approval review did not finish before its deadline. " +
+	"Do not assume the action is unsafe based on the timeout alone. " +
+	"You may retry once, or ask the user for guidance or explicit approval.";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -374,7 +387,7 @@ export function parseVerdict(text: string): GuardianAssessment | undefined {
 	return undefined;
 }
 
-class GuardianReviewTimeoutError extends Error {
+export class GuardianReviewTimeoutError extends Error {
 	constructor(ms: number) {
 		super(`guardian review timed out after ${ms}ms`);
 		this.name = "GuardianReviewTimeoutError";
@@ -479,11 +492,21 @@ function guardianErrorStatus(error: unknown): number | undefined {
 	return undefined;
 }
 
+/**
+ * Retry only recoverable failures (codex-rs/ext/guardian-reviewer/src/retry.rs):
+ * parse errors, rate limits, overload, and connection/stream failures with no
+ * status or a 408/429/5xx status. Everything else (auth, bad request, context
+ * window, 409 conflicts) fails the review immediately.
+ *
+ * Codex also defers the retry until any server-supplied Retry-After time. pi's
+ * `complete()` collapses provider errors to an `errorMessage` string, so that
+ * value is not observable here and only exponential backoff applies.
+ */
 function isRetryableGuardianError(error: unknown): boolean {
 	if (error instanceof GuardianVerdictParseError) return true;
 	if (error instanceof GuardianReviewTimeoutError || error instanceof GuardianReviewCancelledError) return false;
 	const status = guardianErrorStatus(error);
-	if (status !== undefined) return status === 408 || status === 409 || status === 429 || status >= 500;
+	if (status !== undefined) return status === 408 || status === 429 || status >= 500;
 	if (!(error instanceof Error)) return false;
 	const code = (error as Error & { code?: unknown }).code;
 	if (
@@ -492,7 +515,7 @@ function isRetryableGuardianError(error: unknown): boolean {
 	) {
 		return true;
 	}
-	return /(?:\b(?:408|409|429|5\d\d)\b|server overloaded|rate.?limit|service unavailable|fetch failed|connection (?:failed|reset|refused)|response stream (?:disconnected|connection failed))/i.test(
+	return /(?:\b(?:408|429|5\d\d)\b|server overloaded|rate.?limit|service unavailable|fetch failed|connection (?:failed|reset|refused)|response stream (?:disconnected|connection failed))/i.test(
 		error.message,
 	);
 }
@@ -647,13 +670,23 @@ export default function guardianExtension(pi: ExtensionAPI) {
 			// Fail closed: never silently allow on guardian failure.
 			const message = error instanceof Error ? error.message : String(error);
 			logReview(event.toolName, { result: "failure", error: message });
+			if (error instanceof GuardianReviewCancelledError) {
+				// The tool call itself was aborted; there is nobody to ask.
+				return { block: true, reason: "Automatic approval review was cancelled before it completed." };
+			}
+			const timedOut = error instanceof GuardianReviewTimeoutError;
+			const rationale = timedOut
+				? "Automatic approval review timed out while evaluating the requested approval."
+				: `Automatic approval review failed: ${message}`;
 			const approved = await askUser(
 				ctx,
-				"Guardian review failed",
-				`${message}\n\nRun ${event.toolName} anyway?\n\n${truncate(JSON.stringify(input, null, 2), 2_000)}`,
+				timedOut ? "Guardian review timed out" : "Guardian review failed",
+				`${rationale}\n\nRun ${event.toolName} anyway?\n\n${truncate(JSON.stringify(input, null, 2), 2_000)}`,
 			);
 			if (approved) return undefined;
-			return { block: true, reason: `Guardian review failed (${message}); action blocked (fail closed).` };
+			// No assessment was produced, so report a review failure rather than a
+			// risk finding; the agent may retry once after a timeout.
+			return { block: true, reason: `${rationale}\n${timedOut ? TIMEOUT_INSTRUCTIONS : REVIEW_FAILURE_INSTRUCTIONS}` };
 		}
 		setStatus(ctx, "guardian: auto");
 		logReview(event.toolName, {
