@@ -1,11 +1,12 @@
 {
-  "name": "pi-guardian",
+  "name": "pi-auto-approve",
   "version": "0.1.0",
-  "description": "LLM auto-approval guardian extension for the pi coding agent, ported from OpenAI Codex's guardian",
+  "description": "Auto-approve risky tool calls in the pi coding agent with a policy-judging reviewer model (ported from OpenAI Codex's guardian)",
   "type": "module",
   "license": "(MIT AND Apache-2.0)",
-  "repository": "github:erikus/pi-guardian",
-  "keywords": ["pi-package"],
+  "repository": "github:erikus/pi-auto-approve",
+  "keywords": ["pi-package", "auto-approve", "auto-mode", "pi-extension"],
+  "files": ["index.ts", "policy/", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./index.ts"]
   },

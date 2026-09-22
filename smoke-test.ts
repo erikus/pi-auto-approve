@@ -4,8 +4,9 @@ import {
 	buildTranscript,
 	composeReviewPrompt,
 	formatPlannedAction,
-	GuardianInputBudgetError,
+	AutoApproveInputBudgetError,
 	isSafeBashCommand,
+	parseReviewerModelConfig,
 	parseVerdict,
 	passesStaticGates,
 	renderPolicyInstructions,
@@ -66,6 +67,33 @@ assert.equal(
 );
 assert.equal(parseVerdict('{"outcome":"maybe"}'), undefined);
 assert.equal(parseVerdict("I think this is fine."), undefined);
+
+// Reviewer-model override config: exactly `{ "model": "<provider>/<model-id>" }`;
+// anything else is a configuration error that names the file.
+{
+	const path = "/tmp/auto-approve.json";
+	assert.deepEqual(parseReviewerModelConfig('{"model":"anthropic/claude-opus-5"}', path), {
+		provider: "anthropic",
+		modelId: "claude-opus-5",
+	});
+	// Model ids may contain "/" themselves (openrouter); only the first separator splits.
+	assert.deepEqual(parseReviewerModelConfig('{"model":"openrouter/anthropic/claude-opus-5"}', path), {
+		provider: "openrouter",
+		modelId: "anthropic/claude-opus-5",
+	});
+	for (const body of [
+		"not json",
+		"[]",
+		"null",
+		"{}",
+		'{"model": 5}',
+		'{"model": "no-slash"}',
+		'{"model": "/missing-provider"}',
+		'{"model": "missing-id/"}',
+	]) {
+		assert.throws(() => parseReviewerModelConfig(body, path), new RegExp(`^Error: ${path}: `), body);
+	}
+}
 
 // Planned actions are complete, sorted JSON; nothing is ever shortened.
 {
@@ -139,7 +167,7 @@ assert.equal(parseVerdict("I think this is fine."), undefined);
 	// The complete action cannot fit even with nothing else: fail, never shorten.
 	assert.throws(
 		() => composeReviewPrompt({ ...parts, action: "x".repeat(5_000), maxInputTokens: 1_000 }),
-		GuardianInputBudgetError,
+		AutoApproveInputBudgetError,
 	);
 }
 
@@ -156,7 +184,7 @@ assert.equal(parseVerdict("I think this is fine."), undefined);
 				}),
 			10,
 		),
-		/guardian review timed out after 10ms/,
+		/auto-approve review timed out after 10ms/,
 	);
 	assert.equal(aborted, true);
 }

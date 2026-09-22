@@ -1,5 +1,5 @@
 /**
- * Guardian extension for pi - LLM auto-approval of risky tool calls.
+ * Auto-approve extension for pi - LLM auto-approval of risky tool calls.
  *
  * Port of the OpenAI Codex "guardian" auto-review design (Apache-2.0,
  * github.com/openai/codex: codex-rs/core/src/guardian/ for request assembly,
@@ -10,7 +10,7 @@
  *   1. Static gates: read-only tools and an allowlist of safe bash commands
  *      run without review; writes/edits inside the workspace run without
  *      review (pi has no sandbox, so this stands in for workspace-write).
- *   2. Everything else goes to a guardian model that judges the exact action
+ *   2. Everything else goes to a reviewer model that judges the exact action
  *      against a policy (risk_level x user_authorization -> allow/deny),
  *      using a compact transcript as untrusted evidence.
  *   3. Fail closed: timeout, parse failure, or missing model never silently
@@ -31,10 +31,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 // chars at CHARS_PER_TOKEN)
 // ---------------------------------------------------------------------------
 
-const GUARDIAN_PROVIDER = "anthropic";
-const GUARDIAN_MODEL_ID = "claude-opus-5";
-const GUARDIAN_REVIEW_TIMEOUT_MS = 90_000;
-const GUARDIAN_MAX_ATTEMPTS = 3;
+const AUTO_APPROVE_REVIEW_TIMEOUT_MS = 90_000;
+const AUTO_APPROVE_MAX_ATTEMPTS = 3;
 
 const MAX_CONSECUTIVE_DENIALS_PER_TURN = 3;
 const DENIAL_WINDOW_SIZE = 50;
@@ -75,19 +73,25 @@ const UNSAFE_FIND_FLAGS = /-(delete|exec|execdir|ok|okdir)\b/;
 const UNSAFE_SHELL_SYNTAX = /[<>`]|\$\(/;
 
 // Project override -> user override -> bundled Codex default policy.
-const PROJECT_POLICY_PATH = ".pi/guardian-policy.md";
-const USER_POLICY_PATH = join(homedir(), ".pi", "agent", "guardian-policy.md");
+const PROJECT_POLICY_PATH = ".pi/auto-approve-policy.md";
+const USER_POLICY_PATH = join(homedir(), ".pi", "agent", "auto-approve-policy.md");
 // Optional extra policy text appended after the tenant policy (Codex's
 // `[auto_review] extra_policy`). Project file wins over the user file; empty
 // when neither exists.
-const PROJECT_EXTRA_POLICY_PATH = ".pi/guardian-extra-policy.md";
-const USER_EXTRA_POLICY_PATH = join(homedir(), ".pi", "agent", "guardian-extra-policy.md");
+const PROJECT_EXTRA_POLICY_PATH = ".pi/auto-approve-extra-policy.md";
+const USER_EXTRA_POLICY_PATH = join(homedir(), ".pi", "agent", "auto-approve-extra-policy.md");
+// Optional reviewer-model override, `{ "model": "<provider>/<model-id>" }`.
+// Project file wins over the user file; with neither, the session's current
+// model reviews. A malformed file is a configuration error and fails closed.
+const PROJECT_REVIEWER_CONFIG_PATH = ".pi/auto-approve.json";
+const USER_REVIEWER_CONFIG_PATH = join(homedir(), ".pi", "agent", "auto-approve.json");
+const REVIEWER_MODEL_SEPARATOR = "/";
 
 const TENANT_POLICY_CONFIG_PLACEHOLDER = "{{ tenant_policy_config }}";
 const EXTRA_POLICY_PLACEHOLDER = "{{ extra_policy }}";
 
-/** Set PI_GUARDIAN_LOG=/path/to/file to append one JSON line per review. */
-const GUARDIAN_LOG_PATH = process.env.PI_GUARDIAN_LOG;
+/** Set PI_AUTO_APPROVE_LOG=/path/to/file to append one JSON line per review. */
+const AUTO_APPROVE_LOG_PATH = process.env.PI_AUTO_APPROVE_LOG;
 
 const OUTPUT_CONTRACT = `
 # Pi Environment Override
@@ -119,14 +123,14 @@ const TIMEOUT_INSTRUCTIONS =
 type RiskLevel = "low" | "medium" | "high" | "critical";
 type UserAuthorization = "unknown" | "low" | "medium" | "high";
 
-interface GuardianAssessment {
+interface AutoApproveAssessment {
 	outcome: "allow" | "deny";
 	risk_level?: RiskLevel;
 	user_authorization?: UserAuthorization;
 	rationale?: string;
 }
 
-interface GuardianStats {
+interface AutoApproveStats {
 	reviews: number;
 	allowed: number;
 	denied: number;
@@ -156,6 +160,66 @@ function loadExtraPolicy(): string {
 	if (existsSync(projectPolicy)) return readFileSync(projectPolicy, "utf8");
 	if (existsSync(USER_EXTRA_POLICY_PATH)) return readFileSync(USER_EXTRA_POLICY_PATH, "utf8");
 	return "";
+}
+
+// ---------------------------------------------------------------------------
+// Reviewer model configuration
+// ---------------------------------------------------------------------------
+
+type ReviewerModel = NonNullable<ExtensionContext["model"]>;
+
+export interface ReviewerModelRef {
+	provider: string;
+	modelId: string;
+}
+
+/**
+ * Parse an auto-approve.json body. Anything other than
+ * `{ "model": "<provider>/<model-id>" }` is a configuration error; the caller
+ * lets it propagate so a gated action fails closed instead of silently
+ * reviewing with a different model. `path` is only used in error messages.
+ */
+export function parseReviewerModelConfig(text: string, path: string): ReviewerModelRef {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch (error) {
+		throw new Error(`${path}: invalid JSON (${error instanceof Error ? error.message : String(error)})`);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`${path}: expected a JSON object with a "model" field`);
+	}
+	const model = (parsed as Record<string, unknown>).model;
+	if (typeof model !== "string") {
+		throw new Error(`${path}: "model" must be a string of the form "<provider>/<model-id>"`);
+	}
+	// Split at the first separator only, as pi's own model resolver does: model
+	// ids may themselves contain "/" (e.g. openrouter/anthropic/claude-opus-5).
+	const separatorIndex = model.indexOf(REVIEWER_MODEL_SEPARATOR);
+	const provider = separatorIndex === -1 ? "" : model.slice(0, separatorIndex);
+	const modelId = separatorIndex === -1 ? "" : model.slice(separatorIndex + REVIEWER_MODEL_SEPARATOR.length);
+	if (provider === "" || modelId === "") {
+		throw new Error(
+			`${path}: "model" must be "<provider>/<model-id>" with a non-empty provider and model id, got ${JSON.stringify(model)}`,
+		);
+	}
+	return { provider, modelId };
+}
+
+interface ReviewerModelOverride {
+	model: ReviewerModelRef;
+	/** The config file the override was read from (for error messages). */
+	path: string;
+}
+
+/** First existing config file wins; a missing file means no override. */
+function loadReviewerModelConfig(): ReviewerModelOverride | undefined {
+	const projectConfig = resolve(process.cwd(), PROJECT_REVIEWER_CONFIG_PATH);
+	for (const path of [projectConfig, USER_REVIEWER_CONFIG_PATH]) {
+		if (!existsSync(path)) continue;
+		return { model: parseReviewerModelConfig(readFileSync(path, "utf8"), path), path };
+	}
+	return undefined;
 }
 
 /**
@@ -339,6 +403,8 @@ export function selectTranscript(entries: TranscriptEntry[]): SelectedTranscript
 	return { items, omitted: entries.length - items.length };
 }
 
+// Reviewer-prompt marker tags keep Codex's `guardian_` names: policy_template.md
+// (copied verbatim) tells the reviewer how to treat `<guardian_truncated ... />`.
 function renderTranscript(selected: SelectedTranscript): string {
 	if (selected.items.length === 0 && selected.omitted === 0) return "<no retained transcript entries>";
 	const lines = selected.items.map((item) => item.text);
@@ -379,10 +445,10 @@ export function formatPlannedAction(toolName: string, input: unknown): string {
 	return JSON.stringify(sortActionValue(action, "", new WeakSet()), null, 2);
 }
 
-export class GuardianInputBudgetError extends Error {
+export class AutoApproveInputBudgetError extends Error {
 	constructor() {
 		super("the complete action and minimum review context exceed the reviewer input budget");
-		this.name = "GuardianInputBudgetError";
+		this.name = "AutoApproveInputBudgetError";
 	}
 }
 
@@ -410,7 +476,7 @@ export interface ReviewPromptParts {
  * touched. If the rest does not fit: shorten user messages oldest-first only
  * when required content alone overflows, then evict optional evidence lowest
  * priority and oldest first, and add an omission notice. Throws
- * GuardianInputBudgetError when the required content cannot fit at all.
+ * AutoApproveInputBudgetError when the required content cannot fit at all.
  */
 export function composeReviewPrompt(parts: ReviewPromptParts): string {
 	const budgetChars = Math.max(0, parts.maxInputTokens - INPUT_TOKEN_MARGIN) * CHARS_PER_TOKEN;
@@ -446,7 +512,7 @@ export function composeReviewPrompt(parts: ReviewPromptParts): string {
 		item.text = shortened;
 		historyShortened = true;
 	}
-	if (requiredChars > budgetChars) throw new GuardianInputBudgetError();
+	if (requiredChars > budgetChars) throw new AutoApproveInputBudgetError();
 
 	// Optional evidence that cannot fit beside the required content leaves
 	// first; then evict lowest priority, oldest first, until within budget.
@@ -471,8 +537,8 @@ export function composeReviewPrompt(parts: ReviewPromptParts): string {
 		removed.add(candidate.index);
 		prompt = renderKept();
 	}
-	if (removed.size === 0 && !historyShortened) throw new GuardianInputBudgetError();
-	if (prompt.length > budgetChars) throw new GuardianInputBudgetError();
+	if (removed.size === 0 && !historyShortened) throw new AutoApproveInputBudgetError();
+	if (prompt.length > budgetChars) throw new AutoApproveInputBudgetError();
 	return prompt;
 }
 
@@ -514,7 +580,7 @@ function isWorkspacePath(path: unknown): boolean {
 	return absolute === cwd || absolute.startsWith(cwd + sep);
 }
 
-/** True when the action can run without guardian review. */
+/** True when the action can run without model review. */
 export function passesStaticGates(toolName: string, input: Record<string, unknown>): boolean {
 	if (READ_ONLY_TOOLS.has(toolName)) return true;
 	if (WORKSPACE_WRITE_TOOLS.has(toolName)) return isWorkspacePath(input.path);
@@ -525,10 +591,10 @@ export function passesStaticGates(toolName: string, input: Record<string, unknow
 }
 
 // ---------------------------------------------------------------------------
-// Guardian review
+// Reviewer
 // ---------------------------------------------------------------------------
 
-export function parseVerdict(text: string): GuardianAssessment | undefined {
+export function parseVerdict(text: string): AutoApproveAssessment | undefined {
 	const candidates = [text.trim()];
 	const start = text.indexOf("{");
 	const end = text.lastIndexOf("}");
@@ -537,7 +603,7 @@ export function parseVerdict(text: string): GuardianAssessment | undefined {
 		try {
 			const parsed = JSON.parse(candidate) as Record<string, unknown>;
 			if (parsed.outcome === "allow" || parsed.outcome === "deny") {
-				return parsed as unknown as GuardianAssessment;
+				return parsed as unknown as AutoApproveAssessment;
 			}
 		} catch {
 			// try next candidate
@@ -546,24 +612,24 @@ export function parseVerdict(text: string): GuardianAssessment | undefined {
 	return undefined;
 }
 
-export class GuardianReviewTimeoutError extends Error {
+export class AutoApproveReviewTimeoutError extends Error {
 	constructor(ms: number) {
-		super(`guardian review timed out after ${ms}ms`);
-		this.name = "GuardianReviewTimeoutError";
+		super(`auto-approve review timed out after ${ms}ms`);
+		this.name = "AutoApproveReviewTimeoutError";
 	}
 }
 
-class GuardianReviewCancelledError extends Error {
+class AutoApproveReviewCancelledError extends Error {
 	constructor() {
-		super("guardian review cancelled");
-		this.name = "GuardianReviewCancelledError";
+		super("auto-approve review cancelled");
+		this.name = "AutoApproveReviewCancelledError";
 	}
 }
 
-class GuardianVerdictParseError extends Error {
+class AutoApproveVerdictParseError extends Error {
 	constructor(text: string) {
-		super(`unparseable guardian verdict: ${text.slice(0, 200)}`);
-		this.name = "GuardianVerdictParseError";
+		super(`unparseable reviewer verdict: ${text.slice(0, 200)}`);
+		this.name = "AutoApproveVerdictParseError";
 	}
 }
 
@@ -593,8 +659,8 @@ export function withReviewDeadline<T>(
 			controller.abort(error);
 			rejectPromise(error);
 		};
-		const onParentAbort = () => rejectOnce(new GuardianReviewCancelledError());
-		const timer = setTimeout(() => rejectOnce(new GuardianReviewTimeoutError(ms)), ms);
+		const onParentAbort = () => rejectOnce(new AutoApproveReviewCancelledError());
+		const timer = setTimeout(() => rejectOnce(new AutoApproveReviewTimeoutError(ms)), ms);
 		parentSignal?.addEventListener("abort", onParentAbort, { once: true });
 		if (parentSignal?.aborted) {
 			onParentAbort();
@@ -609,7 +675,7 @@ export function withReviewDeadline<T>(
 	});
 }
 
-function guardianRetryDelayMs(attempt: number): number {
+function reviewerRetryDelayMs(attempt: number): number {
 	const base = 200 * 2 ** Math.max(0, attempt - 1);
 	return Math.round(base * (0.9 + Math.random() * 0.2));
 }
@@ -617,12 +683,12 @@ function guardianRetryDelayMs(attempt: number): number {
 function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 	return new Promise((resolvePromise, rejectPromise) => {
 		if (signal.aborted) {
-			rejectPromise(signal.reason ?? new GuardianReviewCancelledError());
+			rejectPromise(signal.reason ?? new AutoApproveReviewCancelledError());
 			return;
 		}
 		const onAbort = () => {
 			clearTimeout(timer);
-			rejectPromise(signal.reason ?? new GuardianReviewCancelledError());
+			rejectPromise(signal.reason ?? new AutoApproveReviewCancelledError());
 		};
 		const timer = setTimeout(() => {
 			signal.removeEventListener("abort", onAbort);
@@ -632,7 +698,7 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 	});
 }
 
-function guardianErrorStatus(error: unknown): number | undefined {
+function reviewerErrorStatus(error: unknown): number | undefined {
 	if (!error || typeof error !== "object") return undefined;
 	const candidate = error as {
 		status?: unknown;
@@ -661,10 +727,10 @@ function guardianErrorStatus(error: unknown): number | undefined {
  * `complete()` collapses provider errors to an `errorMessage` string, so that
  * value is not observable here and only exponential backoff applies.
  */
-function isRetryableGuardianError(error: unknown): boolean {
-	if (error instanceof GuardianVerdictParseError) return true;
-	if (error instanceof GuardianReviewTimeoutError || error instanceof GuardianReviewCancelledError) return false;
-	const status = guardianErrorStatus(error);
+function isRetryableReviewerError(error: unknown): boolean {
+	if (error instanceof AutoApproveVerdictParseError) return true;
+	if (error instanceof AutoApproveReviewTimeoutError || error instanceof AutoApproveReviewCancelledError) return false;
+	const status = reviewerErrorStatus(error);
 	if (status !== undefined) return status === 408 || status === 429 || status >= 500;
 	if (!(error instanceof Error)) return false;
 	const code = (error as Error & { code?: unknown }).code;
@@ -679,9 +745,9 @@ function isRetryableGuardianError(error: unknown): boolean {
 	);
 }
 
-export default function guardianExtension(pi: ExtensionAPI) {
-	const guardianSessionId = randomUUID();
-	const stats: GuardianStats = { reviews: 0, allowed: 0, denied: 0, overridden: 0, failures: 0 };
+export default function autoApproveExtension(pi: ExtensionAPI) {
+	const reviewerSessionId = randomUUID();
+	const stats: AutoApproveStats = { reviews: 0, allowed: 0, denied: 0, overridden: 0, failures: 0 };
 
 	let enabled = true;
 	let breakerTripped = false;
@@ -699,23 +765,34 @@ export default function guardianExtension(pi: ExtensionAPI) {
 	}
 
 	function setStatus(ctx: ExtensionContext, text: string) {
-		if (ctx.hasUI) ctx.ui.setStatus("guardian", text);
+		if (ctx.hasUI) ctx.ui.setStatus("auto-approve", text);
 	}
 
 	function logReview(toolName: string, entry: Record<string, unknown>) {
-		if (!GUARDIAN_LOG_PATH) return;
+		if (!AUTO_APPROVE_LOG_PATH) return;
 		try {
-			appendFileSync(GUARDIAN_LOG_PATH, `${JSON.stringify({ time: new Date().toISOString(), tool: toolName, ...entry })}\n`);
+			appendFileSync(AUTO_APPROVE_LOG_PATH, `${JSON.stringify({ time: new Date().toISOString(), tool: toolName, ...entry })}\n`);
 		} catch {
 			// logging must never break the approval flow
 		}
 	}
 
-	function resolveGuardianModel(ctx: ExtensionContext) {
-		const preferred = ctx.modelRegistry.find(GUARDIAN_PROVIDER, GUARDIAN_MODEL_ID);
-		if (preferred && ctx.modelRegistry.hasConfiguredAuth(preferred)) return preferred;
-		// Codex parity: fall back to the session's main model when the preferred
-		// review model is unavailable.
+	/**
+	 * A configured override must resolve to an authenticated model or the
+	 * review fails closed; without an override the session's model reviews.
+	 */
+	function resolveReviewerModel(ctx: ExtensionContext): ReviewerModel | undefined {
+		const override = loadReviewerModelConfig();
+		if (override) {
+			const { provider, modelId } = override.model;
+			const label = `${provider}${REVIEWER_MODEL_SEPARATOR}${modelId}`;
+			const model = ctx.modelRegistry.find(provider, modelId);
+			if (!model) throw new Error(`${override.path}: reviewer model ${label} is not in pi's model registry`);
+			if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+				throw new Error(`${override.path}: reviewer model ${label} has no configured auth`);
+			}
+			return model;
+		}
 		if (ctx.model && ctx.modelRegistry.hasConfiguredAuth(ctx.model)) return ctx.model;
 		return undefined;
 	}
@@ -724,9 +801,9 @@ export default function guardianExtension(pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		toolName: string,
 		input: unknown,
-	): Promise<GuardianAssessment> {
-		const model = resolveGuardianModel(ctx);
-		if (!model) throw new Error("no guardian model with configured auth");
+	): Promise<AutoApproveAssessment> {
+		const model = resolveReviewerModel(ctx);
+		if (!model) throw new Error("no reviewer model with configured auth");
 		// Codex additionally scales by the model's effective context-window
 		// percent; pi has no such field, so the full window applies.
 		const maxInputTokens = model.contextWindow > 0 ? model.contextWindow : DEFAULT_MAX_INPUT_TOKENS;
@@ -742,22 +819,22 @@ export default function guardianExtension(pi: ExtensionAPI) {
 		return await withReviewDeadline(
 			async (signal) => {
 				let lastError: unknown;
-				for (let attempt = 1; attempt <= GUARDIAN_MAX_ATTEMPTS; attempt++) {
+				for (let attempt = 1; attempt <= AUTO_APPROVE_MAX_ATTEMPTS; attempt++) {
 					try {
 						const response = await ctx.modelRegistry.complete(
 							model,
 							{ messages },
 							{
 								effort: "low",
-								sessionId: guardianSessionId,
+								sessionId: reviewerSessionId,
 								signal,
 								maxRetries: 0,
-								timeoutMs: GUARDIAN_REVIEW_TIMEOUT_MS,
+								timeoutMs: AUTO_APPROVE_REVIEW_TIMEOUT_MS,
 							},
 						);
-						if (response.stopReason === "aborted") throw new GuardianReviewCancelledError();
+						if (response.stopReason === "aborted") throw new AutoApproveReviewCancelledError();
 						if (response.stopReason === "error") {
-							throw new Error(response.errorMessage ?? "guardian model request failed");
+							throw new Error(response.errorMessage ?? "reviewer model request failed");
 						}
 						const text = response.content
 							.filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -765,27 +842,27 @@ export default function guardianExtension(pi: ExtensionAPI) {
 							.join("\n");
 						const verdict = parseVerdict(text);
 						if (verdict) return verdict;
-						throw new GuardianVerdictParseError(text);
+						throw new AutoApproveVerdictParseError(text);
 					} catch (error) {
 						lastError = error;
-						if (attempt >= GUARDIAN_MAX_ATTEMPTS || !isRetryableGuardianError(error)) break;
-						await abortableSleep(guardianRetryDelayMs(attempt), signal);
+						if (attempt >= AUTO_APPROVE_MAX_ATTEMPTS || !isRetryableReviewerError(error)) break;
+						await abortableSleep(reviewerRetryDelayMs(attempt), signal);
 					}
 				}
 				throw lastError instanceof Error ? lastError : new Error(String(lastError));
 			},
-			GUARDIAN_REVIEW_TIMEOUT_MS,
+			AUTO_APPROVE_REVIEW_TIMEOUT_MS,
 			ctx.signal,
 		);
 	}
 
-	/** Manual fallback: prompt the user when the guardian can't decide. */
+	/** Manual fallback: prompt the user when the reviewer can't decide. */
 	async function askUser(ctx: ExtensionContext, title: string, detail: string): Promise<boolean> {
 		if (!ctx.hasUI) return false;
 		return await ctx.ui.confirm(title, detail);
 	}
 
-	function denialReason(toolName: string, verdict: GuardianAssessment): string {
+	function denialReason(toolName: string, verdict: AutoApproveAssessment): string {
 		const risk = verdict.risk_level ?? "unknown";
 		const auth = verdict.user_authorization ?? "unknown";
 		const rationale = verdict.rationale ?? "no rationale provided";
@@ -798,7 +875,7 @@ export default function guardianExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		setStatus(ctx, "guardian: auto");
+		setStatus(ctx, "auto-approve: auto");
 	});
 
 	pi.on("before_agent_start", async () => {
@@ -814,35 +891,35 @@ export default function guardianExtension(pi: ExtensionAPI) {
 		if (breakerTripped) {
 			const approved = await askUser(
 				ctx,
-				"Guardian paused (circuit breaker)",
+				"Auto-approve paused (circuit breaker)",
 				`Run ${event.toolName}?\n\n${truncate(JSON.stringify(input, null, 2), 2_000)}`,
 			);
 			if (approved) return undefined;
-			return { block: true, reason: "Guardian circuit breaker active; user did not approve the action." };
+			return { block: true, reason: "Auto-approve circuit breaker active; user did not approve the action." };
 		}
 
-		setStatus(ctx, "guardian: reviewing…");
+		setStatus(ctx, "auto-approve: reviewing…");
 		stats.reviews += 1;
-		let verdict: GuardianAssessment;
+		let verdict: AutoApproveAssessment;
 		try {
 			verdict = await requestVerdict(ctx, event.toolName, input);
 		} catch (error) {
 			stats.failures += 1;
-			setStatus(ctx, "guardian: auto");
-			// Fail closed: never silently allow on guardian failure.
+			setStatus(ctx, "auto-approve: auto");
+			// Fail closed: never silently allow on review failure.
 			const message = error instanceof Error ? error.message : String(error);
 			logReview(event.toolName, { result: "failure", error: message });
-			if (error instanceof GuardianReviewCancelledError) {
+			if (error instanceof AutoApproveReviewCancelledError) {
 				// The tool call itself was aborted; there is nobody to ask.
 				return { block: true, reason: "Automatic approval review was cancelled before it completed." };
 			}
-			const timedOut = error instanceof GuardianReviewTimeoutError;
+			const timedOut = error instanceof AutoApproveReviewTimeoutError;
 			const rationale = timedOut
 				? "Automatic approval review timed out while evaluating the requested approval."
 				: `Automatic approval review failed: ${message}`;
 			const approved = await askUser(
 				ctx,
-				timedOut ? "Guardian review timed out" : "Guardian review failed",
+				timedOut ? "Auto-approve review timed out" : "Auto-approve review failed",
 				`${rationale}\n\nRun ${event.toolName} anyway?\n\n${truncate(JSON.stringify(input, null, 2), 2_000)}`,
 			);
 			if (approved) return undefined;
@@ -850,7 +927,7 @@ export default function guardianExtension(pi: ExtensionAPI) {
 			// risk finding; the agent may retry once after a timeout.
 			return { block: true, reason: `${rationale}\n${timedOut ? TIMEOUT_INSTRUCTIONS : REVIEW_FAILURE_INSTRUCTIONS}` };
 		}
-		setStatus(ctx, "guardian: auto");
+		setStatus(ctx, "auto-approve: auto");
 		logReview(event.toolName, {
 			result: verdict.outcome,
 			risk: verdict.risk_level,
@@ -867,14 +944,14 @@ export default function guardianExtension(pi: ExtensionAPI) {
 		stats.denied += 1;
 		recordReview(true);
 		if (breakerTripped && ctx.hasUI) {
-			ctx.ui.notify("Guardian circuit breaker tripped; falling back to manual prompts.", "warning");
-			setStatus(ctx, "guardian: paused");
+			ctx.ui.notify("Auto-approve circuit breaker tripped; falling back to manual prompts.", "warning");
+			setStatus(ctx, "auto-approve: paused");
 		}
 
 		const reason = denialReason(event.toolName, verdict);
 		const approved = await askUser(
 			ctx,
-			"Guardian denied this action",
+			"Auto-approve denied this action",
 			`${verdict.rationale ?? "No rationale."}\n\nrisk: ${verdict.risk_level ?? "?"} | authorization: ${verdict.user_authorization ?? "?"}\n\nAllow anyway?`,
 		);
 		if (approved) {
@@ -886,8 +963,8 @@ export default function guardianExtension(pi: ExtensionAPI) {
 		return { block: true, reason };
 	});
 
-	pi.registerCommand("guardian", {
-		description: "Toggle the guardian or show its stats (usage: /guardian [on|off|stats])",
+	pi.registerCommand("auto-approve", {
+		description: "Toggle auto-approve or show its stats (usage: /auto-approve [on|off|stats])",
 		handler: async (args, ctx) => {
 			const arg = (args ?? "").trim();
 			if (arg === "on") {
@@ -895,19 +972,19 @@ export default function guardianExtension(pi: ExtensionAPI) {
 				breakerTripped = false;
 				consecutiveDenials = 0;
 				denialWindow.length = 0;
-				setStatus(ctx, "guardian: auto");
-				ctx.ui.notify("Guardian enabled", "info");
+				setStatus(ctx, "auto-approve: auto");
+				ctx.ui.notify("Auto-approve enabled", "info");
 				return;
 			}
 			if (arg === "off") {
 				enabled = false;
-				setStatus(ctx, "guardian: off");
-				ctx.ui.notify("Guardian disabled", "warning");
+				setStatus(ctx, "auto-approve: off");
+				ctx.ui.notify("Auto-approve disabled", "warning");
 				return;
 			}
 			const state = !enabled ? "off" : breakerTripped ? "paused (circuit breaker)" : "auto";
 			ctx.ui.notify(
-				`Guardian ${state} - reviews: ${stats.reviews}, allowed: ${stats.allowed}, denied: ${stats.denied}, overridden: ${stats.overridden}, failures: ${stats.failures}`,
+				`Auto-approve ${state} - reviews: ${stats.reviews}, allowed: ${stats.allowed}, denied: ${stats.denied}, overridden: ${stats.overridden}, failures: ${stats.failures}`,
 				"info",
 			);
 		},

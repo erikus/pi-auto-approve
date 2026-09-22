@@ -4,7 +4,7 @@
  * live API. Run: node --experimental-strip-types harness-test.ts
  */
 import assert from "node:assert/strict";
-import guardianExtension, { GuardianReviewTimeoutError } from "./index.ts";
+import autoApproveExtension, { AutoApproveReviewTimeoutError } from "./index.ts";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<{ block: boolean; reason?: string } | undefined>;
 
@@ -14,7 +14,7 @@ function makeHarness(completeImpl: () => Promise<string>, options: { contextWind
 		on: (name: string, handler: Handler) => handlers.set(name, handler),
 		registerCommand: () => {},
 	};
-	guardianExtension(fakePi as never);
+	autoApproveExtension(fakePi as never);
 
 	const model = { id: "mock-model", provider: "mock", contextWindow: options.contextWindow };
 	const ctx = {
@@ -22,7 +22,7 @@ function makeHarness(completeImpl: () => Promise<string>, options: { contextWind
 		ui: undefined,
 		model,
 		modelRegistry: {
-			find: () => undefined, // preferred guardian model unavailable -> session fallback
+			find: () => undefined, // no override config in this checkout -> the session model reviews
 			hasConfiguredAuth: () => true,
 			complete: async () => ({ content: [{ type: "text", text: await completeImpl() }] }),
 		},
@@ -105,7 +105,7 @@ function makeHarness(completeImpl: () => Promise<string>, options: { contextWind
 // Timeout -> distinct instructions that permit one agent retry.
 {
 	const h = makeHarness(async () => {
-		throw new GuardianReviewTimeoutError(90_000);
+		throw new AutoApproveReviewTimeoutError(90_000);
 	});
 	const result = await h.review();
 	assert.ok(result?.block, "timeout must block");
