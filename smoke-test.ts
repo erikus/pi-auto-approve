@@ -6,8 +6,27 @@ import {
 	isSafeBashCommand,
 	parseVerdict,
 	passesStaticGates,
+	renderPolicyInstructions,
 	withReviewDeadline,
 } from "./index.ts";
+import { readFileSync } from "node:fs";
+
+// Policy rendering substitutes only template text and never interprets policy contents.
+{
+	const template = "A\n{{ tenant_policy_config }}\n{{ extra_policy }}\nB\n";
+	assert.equal(renderPolicyInstructions(template, "tenant\n", "extra\n"), "A\ntenant\nextra\nB");
+	assert.equal(renderPolicyInstructions(template, "tenant", ""), "A\ntenant\n\nB");
+	// Placeholder-like and `$&`-style text inside either policy stays literal.
+	const rendered = renderPolicyInstructions(template, "keep {{ extra_policy }} and $& here", "$' too");
+	assert.equal(rendered, "A\nkeep {{ extra_policy }} and $& here\n$' too\nB");
+
+	const bundled = renderPolicyInstructions(
+		readFileSync(new URL("./policy/policy_template.md", import.meta.url), "utf8"),
+		readFileSync(new URL("./policy/policy.md", import.meta.url), "utf8"),
+		"",
+	);
+	assert.doesNotMatch(bundled, /\{\{ \w+ \}\}/, "bundled template must render with no leftover placeholders");
+}
 
 // Safe commands pass the static gate.
 assert.equal(isSafeBashCommand("ls -la"), true);

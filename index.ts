@@ -62,6 +62,14 @@ const UNSAFE_SHELL_SYNTAX = /[<>`]|\$\(/;
 // Project override -> user override -> bundled Codex default policy.
 const PROJECT_POLICY_PATH = ".pi/guardian-policy.md";
 const USER_POLICY_PATH = join(homedir(), ".pi", "agent", "guardian-policy.md");
+// Optional extra policy text appended after the tenant policy (Codex's
+// `[auto_review] extra_policy`). Project file wins over the user file; empty
+// when neither exists.
+const PROJECT_EXTRA_POLICY_PATH = ".pi/guardian-extra-policy.md";
+const USER_EXTRA_POLICY_PATH = join(homedir(), ".pi", "agent", "guardian-extra-policy.md");
+
+const TENANT_POLICY_CONFIG_PLACEHOLDER = "{{ tenant_policy_config }}";
+const EXTRA_POLICY_PLACEHOLDER = "{{ extra_policy }}";
 
 /** Set PI_GUARDIAN_LOG=/path/to/file to append one JSON line per review. */
 const GUARDIAN_LOG_PATH = process.env.PI_GUARDIAN_LOG;
@@ -126,6 +134,28 @@ function loadTenantPolicy(): string {
 	if (existsSync(projectPolicy)) return readFileSync(projectPolicy, "utf8");
 	if (existsSync(USER_POLICY_PATH)) return readFileSync(USER_POLICY_PATH, "utf8");
 	return readFileSync(join(extensionDir, "policy", "policy.md"), "utf8");
+}
+
+function loadExtraPolicy(): string {
+	const projectPolicy = resolve(process.cwd(), PROJECT_EXTRA_POLICY_PATH);
+	if (existsSync(projectPolicy)) return readFileSync(projectPolicy, "utf8");
+	if (existsSync(USER_EXTRA_POLICY_PATH)) return readFileSync(USER_EXTRA_POLICY_PATH, "utf8");
+	return "";
+}
+
+/**
+ * Fill the policy template's placeholders (codex-rs/prompts/src/guardian_instructions.rs).
+ * Only template text is substituted: split on the tenant placeholder first so
+ * placeholder-like text inside either policy stays literal, and use split/join
+ * rather than `String.replace` so `$&`-style patterns in a policy are not
+ * interpreted.
+ */
+export function renderPolicyInstructions(template: string, tenantPolicy: string, extraPolicy: string): string {
+	return template
+		.trimEnd()
+		.split(TENANT_POLICY_CONFIG_PLACEHOLDER)
+		.map((part) => part.split(EXTRA_POLICY_PLACEHOLDER).join(extraPolicy.trim()))
+		.join(tenantPolicy.trim());
 }
 
 function truncate(text: string, maxChars: number): string {
@@ -316,9 +346,9 @@ function buildReviewPrompt(ctx: ExtensionContext, toolName: string, input: unkno
 			`planned action exceeds the safe review limit (${action.truncatedFields.slice(0, 5).join(", ")}); refusing to review a shortened action`,
 		);
 	}
-	const template = loadPolicyTemplate().replace("{{ tenant_policy_config }}", loadTenantPolicy().trim());
+	const instructions = renderPolicyInstructions(loadPolicyTemplate(), loadTenantPolicy(), loadExtraPolicy());
 	return [
-		template.trim(),
+		instructions.trim(),
 		OUTPUT_CONTRACT.trim(),
 		"# Transcript (untrusted evidence)",
 		`<transcript>\n${buildTranscript(ctx)}\n</transcript>`,

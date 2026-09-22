@@ -66,6 +66,11 @@ replaced by the first of:
 2. `~/.pi/agent/guardian-policy.md`
 3. bundled `policy/policy.md` (Codex's default tenant policy)
 
+The template's `{{ extra_policy }}` slot (Codex's `[auto_review] extra_policy`) is filled
+from the first of `<project>/.pi/guardian-extra-policy.md` or
+`~/.pi/agent/guardian-extra-policy.md`, and left empty when neither exists. Use it to add
+rules on top of the default policy without replacing it.
+
 Both prompt files are copied verbatim from openai/codex (Apache-2.0); see the license
 note below. The extension appends a pi-specific environment override because pi has no
 operating-system sandbox and the reviewer has no investigation tools. Notable defaults:
