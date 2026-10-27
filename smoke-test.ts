@@ -7,7 +7,7 @@ import {
 	isRetryableReviewerError,
 	AutoApproveInputBudgetError,
 	isSafeBashCommand,
-	parseReviewerModelConfig,
+	parseReviewerConfig,
 	parseVerdict,
 	passesStaticGates,
 	renderPolicyInstructions,
@@ -69,18 +69,23 @@ assert.equal(
 assert.equal(parseVerdict('{"outcome":"maybe"}'), undefined);
 assert.equal(parseVerdict("I think this is fine."), undefined);
 
-// Reviewer-model override config: exactly `{ "model": "<provider>/<model-id>" }`;
-// anything else is a configuration error that names the file.
+// Reviewer config: `{ "model": "<provider>/<model-id>" }` and/or
+// `{ "timeoutMs": <non-negative integer> }`; anything else is a configuration
+// error that names the file.
 {
 	const path = "/tmp/auto-approve.json";
-	assert.deepEqual(parseReviewerModelConfig('{"model":"anthropic/claude-opus-5"}', path), {
-		provider: "anthropic",
-		modelId: "claude-opus-5",
+	assert.deepEqual(parseReviewerConfig('{"model":"anthropic/claude-opus-5"}', path), {
+		model: { provider: "anthropic", modelId: "claude-opus-5" },
 	});
 	// Model ids may contain "/" themselves (openrouter); only the first separator splits.
-	assert.deepEqual(parseReviewerModelConfig('{"model":"openrouter/anthropic/claude-opus-5"}', path), {
-		provider: "openrouter",
-		modelId: "anthropic/claude-opus-5",
+	assert.deepEqual(parseReviewerConfig('{"model":"openrouter/anthropic/claude-opus-5"}', path), {
+		model: { provider: "openrouter", modelId: "anthropic/claude-opus-5" },
+	});
+	assert.deepEqual(parseReviewerConfig('{"timeoutMs": 120000}', path), { timeoutMs: 120_000 });
+	assert.deepEqual(parseReviewerConfig('{"timeoutMs": 0}', path), { timeoutMs: 0 }, "0 means no deadline");
+	assert.deepEqual(parseReviewerConfig('{"model":"anthropic/claude-opus-5","timeoutMs":5000}', path), {
+		model: { provider: "anthropic", modelId: "claude-opus-5" },
+		timeoutMs: 5_000,
 	});
 	for (const body of [
 		"not json",
@@ -91,9 +96,26 @@ assert.equal(parseVerdict("I think this is fine."), undefined);
 		'{"model": "no-slash"}',
 		'{"model": "/missing-provider"}',
 		'{"model": "missing-id/"}',
+		'{"timeoutMs": -1}',
+		'{"timeoutMs": 1.5}',
+		'{"timeoutMs": "90000"}',
+		'{"timeoutMs": null}',
 	]) {
-		assert.throws(() => parseReviewerModelConfig(body, path), new RegExp(`^Error: ${path}: `), body);
+		assert.throws(() => parseReviewerConfig(body, path), new RegExp(`^Error: ${path}: `), body);
 	}
+}
+
+// An unlimited deadline never fires a timer but still honors cancellation.
+{
+	assert.equal(await withReviewDeadline(async () => "done", 0), "done");
+	const parent = new AbortController();
+	const pending = withReviewDeadline(
+		(signal) => new Promise<string>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason))),
+		0,
+		parent.signal,
+	);
+	parent.abort();
+	await assert.rejects(pending, /review cancelled/);
 }
 
 // Planned actions are complete, sorted JSON; nothing is ever shortened.
