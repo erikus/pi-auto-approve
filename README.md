@@ -47,7 +47,9 @@ Set `PI_AUTO_APPROVE_LOG=/path/to/file` to append one JSON line per review.
      `grep`, …, no redirection/substitution) run freely.
 2. **Auto-approve review** for everything else: the extension builds a compact transcript
    (every user message, plus recent assistant/tool evidence that is capped,
-   truncation-tagged, and treated according to the policy's trust rules), renders the
+   truncation-tagged, and treated according to the policy's trust rules; compaction and
+   branch summaries and extension-injected messages are attributed to the assistant,
+   never the user, because generated text is not authorization), renders the
    complete planned action, fits the request into the reviewer model's context window
    (optional evidence is evicted first, user messages are shortened only as a last
    resort, and an omission notice tells the reviewer not to infer authorization from
