@@ -4,7 +4,19 @@
  * live API. Run: node --experimental-strip-types harness-test.ts
  */
 import assert from "node:assert/strict";
-import autoApproveExtension, { AutoApproveReviewTimeoutError } from "./index.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Isolate the harness from the developer's own pi configuration. The extension
+// resolves ~/.pi/agent/auto-approve.json and the user policy files from $HOME
+// when it is imported, and <cwd>/.pi/ on every review, so a real reviewer-model
+// override or custom policy would otherwise leak into these tests. HOME must be
+// set before the extension module loads, hence the dynamic import.
+const scratchHome = mkdtempSync(join(tmpdir(), "pi-auto-approve-harness-"));
+process.env.HOME = scratchHome;
+process.chdir(scratchHome);
+const { default: autoApproveExtension, AutoApproveReviewTimeoutError } = await import("./index.ts");
 
 type Handler = (event: unknown, ctx: unknown) => Promise<{ block: boolean; reason?: string } | undefined>;
 

@@ -137,6 +137,9 @@ node --experimental-strip-types smoke-test.ts   # static-gate, parser, and budge
 node --experimental-strip-types harness-test.ts # tool_call handler against a mocked registry
 ```
 
+The harness runs under a scratch `HOME` and working directory so your own
+`~/.pi/agent/auto-approve.json` and policy files do not affect it.
+
 ## License / attribution
 
 The extension code is MIT licensed (see `LICENSE`).
