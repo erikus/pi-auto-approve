@@ -4,7 +4,7 @@
  * live API. Run: node --experimental-strip-types harness-test.ts
  */
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,8 +27,8 @@ function userEntry(id: string, text: string): BranchEntry {
 }
 
 function makeHarness(
-	completeImpl: () => Promise<string>,
-	options: { contextWindow?: number; branch?: () => BranchEntry[] } = {},
+	completeImpl: (signal?: AbortSignal) => Promise<string>,
+	options: { contextWindow?: number; branch?: () => BranchEntry[]; signal?: AbortSignal } = {},
 ) {
 	const handlers = new Map<string, Handler>();
 	const fakePi = {
@@ -45,11 +45,14 @@ function makeHarness(
 		modelRegistry: {
 			find: () => undefined, // no override config in this checkout -> the session model reviews
 			hasConfiguredAuth: () => true,
-			complete: async () => ({ content: [{ type: "text", text: await completeImpl() }] }),
+			complete: async (_model: unknown, _request: unknown, opts?: { signal?: AbortSignal }) => ({
+				content: [{ type: "text", text: await completeImpl(opts?.signal) }],
+			}),
 		},
 		sessionManager: {
 			getBranch: options.branch ?? (() => [userEntry("u1", "please do the thing")]),
 		},
+		signal: options.signal,
 	};
 
 	const toolCall = handlers.get("tool_call");
@@ -117,6 +120,43 @@ function makeHarness(
 	assert.ok(result?.block, "409 must fail closed");
 	assert.equal(calls, 1, "409 must not retry");
 }
+
+/** Run `fn` with a project `.pi/auto-approve.json` of `body` in a scratch cwd. */
+async function withProjectConfig(body: string, fn: () => Promise<void>): Promise<void> {
+	const dir = mkdtempSync(join(tmpdir(), "pi-auto-approve-harness-"));
+	mkdirSync(join(dir, ".pi"));
+	writeFileSync(join(dir, ".pi", "auto-approve.json"), body);
+	const previous = process.cwd();
+	process.chdir(dir);
+	try {
+		await fn();
+	} finally {
+		process.chdir(previous);
+	}
+}
+
+const neverResolves = (signal?: AbortSignal) =>
+	new Promise<string>((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+
+// A configured timeoutMs replaces the 90s default as the whole review's budget.
+await withProjectConfig('{"timeoutMs": 40}', async () => {
+	const h = makeHarness(neverResolves);
+	const started = Date.now();
+	const result = await h.review();
+	assert.ok(result?.block, "configured timeout must block");
+	assert.match(result.reason ?? "", /timed out while evaluating/);
+	assert.ok(Date.now() - started < 1_000, "the configured deadline applies, not the default");
+});
+
+// timeoutMs 0 disables the deadline; cancellation still ends the review.
+await withProjectConfig('{"timeoutMs": 0}', async () => {
+	const controller = new AbortController();
+	const h = makeHarness(neverResolves, { signal: controller.signal });
+	setTimeout(() => controller.abort(), 30);
+	const result = await h.review();
+	assert.ok(result?.block, "cancelled review must block");
+	assert.match(result.reason ?? "", /cancelled before it completed/);
+});
 
 // Timeout -> distinct instructions that permit one agent retry.
 {
