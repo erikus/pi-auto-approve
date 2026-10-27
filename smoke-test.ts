@@ -4,6 +4,7 @@ import {
 	buildTranscript,
 	composeReviewPrompt,
 	formatPlannedAction,
+	isRetryableReviewerError,
 	AutoApproveInputBudgetError,
 	isSafeBashCommand,
 	parseReviewerModelConfig,
@@ -284,6 +285,26 @@ const MAX_SUMMARY_PROBE = 25_000;
 	} as never);
 	assert.match(transcript, /keep this authorization/);
 	assert.match(transcript, /omitted_transcript_entries=/);
+}
+
+// Retry classification (codex retry.rs should_retry_guardian_review): terminal
+// provider classifications win over transient-looking wrappers.
+{
+	const withStatus = (message: string, status: number) => Object.assign(new Error(message), { status });
+	const withCode = (message: string, code: string) => Object.assign(new Error(message), { code });
+	assert.equal(isRetryableReviewerError(withStatus("overloaded", 503)), true);
+	assert.equal(isRetryableReviewerError(withStatus("slow down", 429)), true);
+	assert.equal(isRetryableReviewerError(withStatus("conflict", 409)), false);
+	assert.equal(isRetryableReviewerError(withStatus("bad request", 400)), false);
+	assert.equal(isRetryableReviewerError(withCode("socket hang up", "ECONNRESET")), true);
+	assert.equal(isRetryableReviewerError(new Error("Flex capacity unavailable.")), true);
+	assert.equal(isRetryableReviewerError(new Error('429 {"error":{"code":"flex_unavailable"}}')), true);
+	assert.equal(isRetryableReviewerError(new Error("The model `gpt-9` does not exist or you do not have access")), false);
+	assert.equal(isRetryableReviewerError(withStatus('{"error":{"code":"model_not_found"}}', 503)), false);
+	assert.equal(isRetryableReviewerError(new Error("429 invalid_prompt: rejected by safety system")), false);
+	assert.equal(isRetryableReviewerError(new Error("Invalid API key")), false);
+	assert.equal(isRetryableReviewerError(new Error("something odd")), false);
+	assert.equal(isRetryableReviewerError("not an error"), false);
 }
 
 console.log("all smoke tests passed");
