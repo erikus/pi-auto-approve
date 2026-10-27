@@ -61,7 +61,8 @@ Set `PI_AUTO_APPROVE_LOG=/path/to/file` to append one JSON line per review.
    stale-authorization retry). Denials stand regardless.
 3. **Deny** blocks the tool call with instructions to the agent not to work around the
    denial (mirroring Codex). In the TUI you get an "Allow anyway?" override prompt - a manual approval is final, like Codex's post-denial user approval.
-4. **Fail closed**: timeout (one 90s deadline shared by all attempts), unparseable
+4. **Fail closed**: timeout (one 90s deadline shared by all attempts, see Model and
+   timeout below), unparseable
    verdict, oversized action, malformed reviewer config, or no authenticated model never
    silently allows - with a UI you're prompted; headless, the action is blocked. Parse
    errors and transient service/network failures (408/429/5xx, overload, rate limits,
@@ -74,27 +75,32 @@ Set `PI_AUTO_APPROVE_LOG=/path/to/file` to append one JSON line per review.
    reviews pauses auto-review; gated actions fall back to manual prompts
    (the same shape as Claude Code's auto-mode breaker).
 
-## Model
+## Model and timeout
 
 By default the reviewer is the session's current model (`ctx.model`), always run at
-low effort regardless of the session's effort setting. To review with a different
-model, create the first of:
+low effort regardless of the session's effort setting, under a 90 second budget
+shared by setup and all retry attempts. To change either, create the first of:
 
 1. `<project>/.pi/auto-approve.json`
 2. `~/.pi/agent/auto-approve.json`
 
-containing exactly:
+containing a JSON object with one or both of these fields:
 
 ```json
-{ "model": "<provider>/<model-id>" }
+{ "model": "<provider>/<model-id>", "timeoutMs": 90000 }
 ```
 
-for example `{ "model": "anthropic/claude-opus-5" }`. The provider is everything before
-the first `/`, so OpenRouter-style ids like `openrouter/anthropic/claude-opus-5` work. The model must exist in pi's
-model registry and have configured auth. A malformed file, an unknown model, or a
-model without auth is a configuration error: gated actions fail closed with a message
-naming the file, rather than silently falling back to the session model. A missing
-file simply means no override.
+`model`, for example `"anthropic/claude-opus-5"`: the provider is everything before the
+first `/`, so OpenRouter-style ids like `openrouter/anthropic/claude-opus-5` work. The
+model must exist in pi's model registry and have configured auth.
+
+`timeoutMs` (Codex's `[auto_review] timeout_ms`): the whole review's budget in
+milliseconds, as a non-negative integer. `0` disables the deadline; cancellation, the
+three-attempt limit, and the provider's own transport timeout still apply.
+
+A malformed file, an unknown model, or a model without auth is a configuration error:
+gated actions fail closed with a message naming the file, rather than silently falling
+back to the defaults. A missing file simply means the defaults apply.
 
 ## Policy
 
