@@ -273,23 +273,80 @@ interface TranscriptEntry {
 	text: string;
 }
 
+function textOf(content: unknown): string {
+	return contentBlocks(content)
+		.filter((b) => b.type === "text" && typeof b.text === "string")
+		.map((b) => b.text as string)
+		.join("\n")
+		.trim();
+}
+
+/**
+ * Host-generated text that pi delivers to the model in the user wire role but
+ * that no human wrote: compaction and branch summaries, and extension-injected
+ * custom messages. The reviewer sees it as capped assistant-side evidence
+ * (codex-rs/guardian-context/src/transcript.rs attributes `compaction.summary`
+ * to the assistant: "its generated summary is not user authorization").
+ */
+function generatedEntry(label: string, text: string): TranscriptEntry | undefined {
+	if (!text) return undefined;
+	return { kind: "assistant", text: `Assistant (${label}): ${truncate(text, MAX_CHARS_PER_MESSAGE)}` };
+}
+
+interface BranchEntry {
+	type: string;
+	summary?: string;
+	customType?: string;
+	content?: unknown;
+	message?: {
+		role?: string;
+		toolName?: string;
+		content?: unknown;
+		isError?: boolean;
+		summary?: string;
+		customType?: string;
+	};
+}
+
 function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
 	const sections: TranscriptEntry[] = [];
-	const entries = ctx.sessionManager.getBranch().filter((e: { type: string }) => e.type === "message");
+	const push = (entry: TranscriptEntry | undefined) => {
+		if (entry) sections.push(entry);
+	};
 
-	for (const entry of entries as Array<{
-		message?: { role?: string; toolName?: string; content?: unknown; isError?: boolean };
-	}>) {
+	for (const entry of ctx.sessionManager.getBranch() as BranchEntry[]) {
+		if (entry.type === "compaction") {
+			push(generatedEntry("compaction summary", entry.summary ?? ""));
+			continue;
+		}
+		if (entry.type === "branch_summary") {
+			push(generatedEntry("branch summary", entry.summary ?? ""));
+			continue;
+		}
+		if (entry.type === "custom_message") {
+			push(generatedEntry(`extension message ${entry.customType ?? "unknown"}`, textOf(entry.content)));
+			continue;
+		}
+		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (!message?.role) continue;
+		// The same generated content can also appear as message roles.
+		if (message.role === "compactionSummary") {
+			push(generatedEntry("compaction summary", message.summary ?? ""));
+			continue;
+		}
+		if (message.role === "branchSummary") {
+			push(generatedEntry("branch summary", message.summary ?? ""));
+			continue;
+		}
+		if (message.role === "custom") {
+			push(generatedEntry(`extension message ${message.customType ?? "unknown"}`, textOf(message.content)));
+			continue;
+		}
 		const blocks = contentBlocks(message.content);
 
 		if (message.role === "user" || message.role === "assistant") {
-			const text = blocks
-				.filter((b) => b.type === "text" && typeof b.text === "string")
-				.map((b) => b.text as string)
-				.join("\n")
-				.trim();
+			const text = textOf(message.content);
 			if (text) {
 				// Only assistant text gets a per-entry cap; user text is authorization
 				// evidence and is kept complete at this stage.
@@ -311,11 +368,7 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
 				}
 			}
 		} else if (message.role === "toolResult") {
-			const text = blocks
-				.filter((b) => b.type === "text" && typeof b.text === "string")
-				.map((b) => b.text as string)
-				.join("\n")
-				.trim();
+			const text = textOf(message.content);
 			const errorTag = message.isError ? " (error)" : "";
 			sections.push({
 				kind: "tool",
