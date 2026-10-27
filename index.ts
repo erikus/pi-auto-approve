@@ -33,6 +33,26 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const AUTO_APPROVE_REVIEW_TIMEOUT_MS = 90_000;
 const AUTO_APPROVE_MAX_ATTEMPTS = 3;
+// Retry classification mirrors codex-rs/ext/guardian-reviewer/src/retry.rs
+// `should_retry_guardian_review`, mapped onto the messages pi's providers
+// surface. Node socket codes stand in for Codex's connection-failure variants.
+const TRANSIENT_REVIEWER_ERROR_CODES = new Set([
+	"ECONNRESET",
+	"ECONNREFUSED",
+	"ETIMEDOUT",
+	"EAI_AGAIN",
+	"ENETDOWN",
+	"ENETUNREACH",
+	"EPIPE",
+]);
+// Terminal provider classifications are checked before the transient
+// patterns: an unknown model or rejected prompt does not get better on
+// retry even when the provider wraps it in a 5xx or mentions rate limits
+// (codex `ModelNotFound`, `InvalidPrompt`, `BadRequest`, `Unauthorized`).
+const TERMINAL_REVIEWER_ERROR_PATTERN =
+	/(?:model_not_found|invalid_prompt|invalid[ _]api[ _]key|\bmodel\b[^\n]{0,80}\b(?:not found|does not exist|is not available)|\binvalid prompt\b)/i;
+const TRANSIENT_REVIEWER_ERROR_PATTERN =
+	/(?:\b(?:408|429|5\d\d)\b|server overloaded|rate.?limit|flex_unavailable|flex capacity|service unavailable|fetch failed|connection (?:failed|reset|refused)|response stream (?:disconnected|connection failed))/i;
 
 const MAX_CONSECUTIVE_DENIALS_PER_TURN = 3;
 const DENIAL_WINDOW_SIZE = 50;
@@ -705,6 +725,18 @@ class AutoApproveVerdictParseError extends Error {
 }
 
 /**
+ * The reviewer finished without producing any text. Codex treats this as a
+ * terminal session error rather than a parse failure ("guardian review
+ * completed without an assessment payload"), so it is not retried.
+ */
+export class AutoApproveMissingAssessmentError extends Error {
+	constructor() {
+		super("reviewer completed without an assessment payload");
+		this.name = "AutoApproveMissingAssessmentError";
+	}
+}
+
+/**
  * An allow verdict was reached against authorization evidence that changed
  * while the reviewer ran (codex-rs/ext/guardian-reviewer/src/outcome.rs
  * `StaleAuthorization`). The verdict is discarded and the review retried.
@@ -810,22 +842,23 @@ function reviewerErrorStatus(error: unknown): number | undefined {
  * `complete()` collapses provider errors to an `errorMessage` string, so that
  * value is not observable here and only exponential backoff applies.
  */
-function isRetryableReviewerError(error: unknown): boolean {
+export function isRetryableReviewerError(error: unknown): boolean {
 	if (error instanceof AutoApproveVerdictParseError || error instanceof AutoApproveStaleAuthorizationError) return true;
-	if (error instanceof AutoApproveReviewTimeoutError || error instanceof AutoApproveReviewCancelledError) return false;
+	if (
+		error instanceof AutoApproveReviewTimeoutError ||
+		error instanceof AutoApproveReviewCancelledError ||
+		error instanceof AutoApproveMissingAssessmentError ||
+		error instanceof AutoApproveInputBudgetError
+	) {
+		return false;
+	}
+	if (!(error instanceof Error)) return false;
+	if (TERMINAL_REVIEWER_ERROR_PATTERN.test(error.message)) return false;
 	const status = reviewerErrorStatus(error);
 	if (status !== undefined) return status === 408 || status === 429 || status >= 500;
-	if (!(error instanceof Error)) return false;
 	const code = (error as Error & { code?: unknown }).code;
-	if (
-		typeof code === "string" &&
-		new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENETDOWN", "ENETUNREACH", "EPIPE"]).has(code)
-	) {
-		return true;
-	}
-	return /(?:\b(?:408|429|5\d\d)\b|server overloaded|rate.?limit|service unavailable|fetch failed|connection (?:failed|reset|refused)|response stream (?:disconnected|connection failed))/i.test(
-		error.message,
-	);
+	if (typeof code === "string" && TRANSIENT_REVIEWER_ERROR_CODES.has(code)) return true;
+	return TRANSIENT_REVIEWER_ERROR_PATTERN.test(error.message);
 }
 
 export default function autoApproveExtension(pi: ExtensionAPI) {
@@ -927,6 +960,7 @@ export default function autoApproveExtension(pi: ExtensionAPI) {
 							.filter((c): c is { type: "text"; text: string } => c.type === "text")
 							.map((c) => c.text)
 							.join("\n");
+						if (!text.trim()) throw new AutoApproveMissingAssessmentError();
 						const verdict = parseVerdict(text);
 						if (!verdict) throw new AutoApproveVerdictParseError(text);
 						// An allow is valid only for the authorization it was judged

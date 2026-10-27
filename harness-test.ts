@@ -141,6 +141,46 @@ function makeHarness(
 	assert.equal(calls, 3, "parse failures should use the three-attempt budget");
 }
 
+// An empty reviewer response is a terminal session failure, not a parse
+// failure: no retry, and the reason names the missing payload.
+{
+	let calls = 0;
+	const h = makeHarness(async () => {
+		calls++;
+		return "";
+	});
+	const result = await h.review();
+	assert.ok(result?.block, "empty response must block");
+	assert.match(result.reason ?? "", /review failed: reviewer completed without an assessment payload/);
+	assert.match(result.reason ?? "", /review failure, not a determination that the action is unsafe/);
+	assert.equal(calls, 1, "a missing assessment payload must not retry");
+}
+
+// A model-not-found provider error is terminal even without an HTTP status.
+{
+	let calls = 0;
+	const h = makeHarness(async () => {
+		calls++;
+		throw new Error('{"error":{"code":"model_not_found","message":"Access to this deployment ended."}}');
+	});
+	const result = await h.review();
+	assert.ok(result?.block, "unknown model must fail closed");
+	assert.match(result.reason ?? "", /model_not_found/);
+	assert.equal(calls, 1, "model_not_found must not retry");
+}
+
+// Flex capacity failures retry like other transient service failures.
+{
+	let calls = 0;
+	const h = makeHarness(async () => {
+		calls++;
+		if (calls === 1) throw new Error("Flex capacity unavailable.");
+		return '{"outcome":"allow"}';
+	});
+	assert.equal(await h.review(), undefined);
+	assert.equal(calls, 2, "flex capacity failures should retry");
+}
+
 // Transient service failure -> retry with backoff.
 {
 	let calls = 0;

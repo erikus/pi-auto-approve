@@ -64,8 +64,10 @@ Set `PI_AUTO_APPROVE_LOG=/path/to/file` to append one JSON line per review.
 4. **Fail closed**: timeout (one 90s deadline shared by all attempts), unparseable
    verdict, oversized action, malformed reviewer config, or no authenticated model never
    silently allows - with a UI you're prompted; headless, the action is blocked. Parse
-   errors and transient service/network failures retry up to three total attempts with
-   backoff; permanent failures do not retry. The planned action is never shortened for
+   errors and transient service/network failures (408/429/5xx, overload, rate limits,
+   Flex capacity, dropped connections) retry up to three total attempts with backoff;
+   permanent failures (unknown model, rejected prompt, bad credentials, an empty reviewer
+   response) do not retry, matching Codex's retry classification. The planned action is never shortened for
    model review and then run in full: if it cannot fit the reviewer's window beside the
    policy and the minimum evidence, the review fails.
 5. **Circuit breaker**: 3 consecutive denials in a turn or 10 denials in the last 50
