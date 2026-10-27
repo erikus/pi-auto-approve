@@ -8,7 +8,16 @@ import autoApproveExtension, { AutoApproveReviewTimeoutError } from "./index.ts"
 
 type Handler = (event: unknown, ctx: unknown) => Promise<{ block: boolean; reason?: string } | undefined>;
 
-function makeHarness(completeImpl: () => Promise<string>, options: { contextWindow?: number } = {}) {
+type BranchEntry = { type: string; id?: string; message?: { role: string; content: unknown } };
+
+function userEntry(id: string, text: string): BranchEntry {
+	return { type: "message", id, message: { role: "user", content: [{ type: "text", text }] } };
+}
+
+function makeHarness(
+	completeImpl: () => Promise<string>,
+	options: { contextWindow?: number; branch?: () => BranchEntry[] } = {},
+) {
 	const handlers = new Map<string, Handler>();
 	const fakePi = {
 		on: (name: string, handler: Handler) => handlers.set(name, handler),
@@ -27,12 +36,7 @@ function makeHarness(completeImpl: () => Promise<string>, options: { contextWind
 			complete: async () => ({ content: [{ type: "text", text: await completeImpl() }] }),
 		},
 		sessionManager: {
-			getBranch: () => [
-				{
-					type: "message",
-					message: { role: "user", content: [{ type: "text", text: "please do the thing" }] },
-				},
-			],
+			getBranch: options.branch ?? (() => [userEntry("u1", "please do the thing")]),
 		},
 	};
 
@@ -139,6 +143,62 @@ function makeHarness(completeImpl: () => Promise<string>, options: { contextWind
 	});
 	assert.equal(await h.review(), undefined);
 	assert.equal(calls, 2, "transient failures should retry");
+}
+
+// A user message that lands mid-review invalidates an allow: the verdict is
+// discarded and the review is redone against the new evidence without backoff.
+{
+	const branch = [userEntry("u1", "please do the thing")];
+	let calls = 0;
+	const h = makeHarness(
+		async () => {
+			calls++;
+			if (calls === 1) branch.push(userEntry("u2", "wait, not that"));
+			return '{"outcome":"allow"}';
+		},
+		{ branch: () => branch },
+	);
+	const started = Date.now();
+	assert.equal(await h.review(), undefined);
+	assert.equal(calls, 2, "a stale allow must be re-reviewed against the new user message");
+	assert.ok(Date.now() - started < 150, "stale-authorization retries must skip the service backoff");
+}
+
+// Authorization that keeps changing exhausts the attempt budget and fails
+// closed as a review failure, not a risk finding.
+{
+	const branch = [userEntry("u1", "please do the thing")];
+	let calls = 0;
+	const h = makeHarness(
+		async () => {
+			calls++;
+			branch.push(userEntry(`u${calls + 1}`, "and also this"));
+			return '{"outcome":"allow"}';
+		},
+		{ branch: () => branch },
+	);
+	const result = await h.review();
+	assert.ok(result?.block, "an allow never applied against current authorization must block");
+	assert.match(result.reason ?? "", /review failed: authorization changed before approval could be applied/);
+	assert.match(result.reason ?? "", /review failure, not a determination that the action is unsafe/);
+	assert.equal(calls, 3, "stale authorization consumes the shared attempt budget");
+}
+
+// A denial stands even if a user message arrives mid-review (only allows are re-checked).
+{
+	const branch = [userEntry("u1", "please do the thing")];
+	let calls = 0;
+	const h = makeHarness(
+		async () => {
+			calls++;
+			branch.push(userEntry("u2", "go ahead, I approve"));
+			return '{"risk_level":"high","user_authorization":"low","outcome":"deny","rationale":"not authorized"}';
+		},
+		{ branch: () => branch },
+	);
+	const result = await h.review();
+	assert.ok(result?.block, "deny must block");
+	assert.equal(calls, 1, "denials are not re-reviewed on authorization change");
 }
 
 // An action that cannot fit the reviewer's window is never shortened for review
