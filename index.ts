@@ -32,6 +32,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 // ---------------------------------------------------------------------------
 
 const AUTO_APPROVE_REVIEW_TIMEOUT_MS = 90_000;
+// A configured `timeoutMs` of 0 disables the overall review deadline (codex
+// `[auto_review] timeout_ms = 0`); cancellation, the attempt limit, and the
+// provider's own transport timeout still apply.
+const REVIEW_TIMEOUT_UNLIMITED_MS = 0;
 const AUTO_APPROVE_MAX_ATTEMPTS = 3;
 // Retry classification mirrors codex-rs/ext/guardian-reviewer/src/retry.rs
 // `should_retry_guardian_review`, mapped onto the messages pi's providers
@@ -100,9 +104,10 @@ const USER_POLICY_PATH = join(homedir(), ".pi", "agent", "auto-approve-policy.md
 // when neither exists.
 const PROJECT_EXTRA_POLICY_PATH = ".pi/auto-approve-extra-policy.md";
 const USER_EXTRA_POLICY_PATH = join(homedir(), ".pi", "agent", "auto-approve-extra-policy.md");
-// Optional reviewer-model override, `{ "model": "<provider>/<model-id>" }`.
-// Project file wins over the user file; with neither, the session's current
-// model reviews. A malformed file is a configuration error and fails closed.
+// Optional reviewer config, `{ "model": "<provider>/<model-id>", "timeoutMs": 90000 }`
+// (either field may be omitted). Project file wins over the user file; with
+// neither, the session's current model reviews under the default deadline. A
+// malformed file is a configuration error and fails closed.
 const PROJECT_REVIEWER_CONFIG_PATH = ".pi/auto-approve.json";
 const USER_REVIEWER_CONFIG_PATH = join(homedir(), ".pi", "agent", "auto-approve.json");
 const REVIEWER_MODEL_SEPARATOR = "/";
@@ -193,13 +198,24 @@ export interface ReviewerModelRef {
 	modelId: string;
 }
 
+export interface ReviewerConfig {
+	model?: ReviewerModelRef;
+	/**
+	 * Overall review budget in milliseconds, shared by setup and every attempt
+	 * (codex `[auto_review] timeout_ms`). REVIEW_TIMEOUT_UNLIMITED_MS disables
+	 * the deadline.
+	 */
+	timeoutMs?: number;
+}
+
 /**
- * Parse an auto-approve.json body. Anything other than
- * `{ "model": "<provider>/<model-id>" }` is a configuration error; the caller
- * lets it propagate so a gated action fails closed instead of silently
- * reviewing with a different model. `path` is only used in error messages.
+ * Parse an auto-approve.json body. Anything other than a JSON object with a
+ * `"model": "<provider>/<model-id>"` string and/or a non-negative integer
+ * `"timeoutMs"` is a configuration error; the caller lets it propagate so a
+ * gated action fails closed instead of silently reviewing with different
+ * settings. `path` is only used in error messages.
  */
-export function parseReviewerModelConfig(text: string, path: string): ReviewerModelRef {
+export function parseReviewerConfig(text: string, path: string): ReviewerConfig {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(text);
@@ -207,9 +223,26 @@ export function parseReviewerModelConfig(text: string, path: string): ReviewerMo
 		throw new Error(`${path}: invalid JSON (${error instanceof Error ? error.message : String(error)})`);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		throw new Error(`${path}: expected a JSON object with a "model" field`);
+		throw new Error(`${path}: expected a JSON object with a "model" and/or "timeoutMs" field`);
 	}
-	const model = (parsed as Record<string, unknown>).model;
+	const { model, timeoutMs } = parsed as Record<string, unknown>;
+	if (model === undefined && timeoutMs === undefined) {
+		throw new Error(`${path}: expected a JSON object with a "model" and/or "timeoutMs" field`);
+	}
+	const config: ReviewerConfig = {};
+	if (timeoutMs !== undefined) {
+		if (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < REVIEW_TIMEOUT_UNLIMITED_MS) {
+			throw new Error(
+				`${path}: "timeoutMs" must be a non-negative integer number of milliseconds (${REVIEW_TIMEOUT_UNLIMITED_MS} disables the deadline), got ${JSON.stringify(timeoutMs)}`,
+			);
+		}
+		config.timeoutMs = timeoutMs;
+	}
+	if (model !== undefined) config.model = parseReviewerModelRef(model, path);
+	return config;
+}
+
+function parseReviewerModelRef(model: unknown, path: string): ReviewerModelRef {
 	if (typeof model !== "string") {
 		throw new Error(`${path}: "model" must be a string of the form "<provider>/<model-id>"`);
 	}
@@ -226,18 +259,18 @@ export function parseReviewerModelConfig(text: string, path: string): ReviewerMo
 	return { provider, modelId };
 }
 
-interface ReviewerModelOverride {
-	model: ReviewerModelRef;
-	/** The config file the override was read from (for error messages). */
+interface LoadedReviewerConfig {
+	config: ReviewerConfig;
+	/** The config file the settings were read from (for error messages). */
 	path: string;
 }
 
 /** First existing config file wins; a missing file means no override. */
-function loadReviewerModelConfig(): ReviewerModelOverride | undefined {
+function loadReviewerConfig(): LoadedReviewerConfig | undefined {
 	const projectConfig = resolve(process.cwd(), PROJECT_REVIEWER_CONFIG_PATH);
 	for (const path of [projectConfig, USER_REVIEWER_CONFIG_PATH]) {
 		if (!existsSync(path)) continue;
-		return { model: parseReviewerModelConfig(readFileSync(path, "utf8"), path), path };
+		return { config: parseReviewerConfig(readFileSync(path, "utf8"), path), path };
 	}
 	return undefined;
 }
@@ -748,7 +781,11 @@ export class AutoApproveStaleAuthorizationError extends Error {
 	}
 }
 
-/** Run an operation under one abortable deadline, including any retries/backoff. */
+/**
+ * Run an operation under one abortable deadline, including any retries/backoff.
+ * `ms === REVIEW_TIMEOUT_UNLIMITED_MS` runs with no deadline; the parent signal
+ * still cancels.
+ */
 export function withReviewDeadline<T>(
 	operation: (signal: AbortSignal) => Promise<T>,
 	ms: number,
@@ -758,7 +795,7 @@ export function withReviewDeadline<T>(
 		const controller = new AbortController();
 		let settled = false;
 		const cleanup = () => {
-			clearTimeout(timer);
+			if (timer !== undefined) clearTimeout(timer);
 			parentSignal?.removeEventListener("abort", onParentAbort);
 		};
 		const resolveOnce = (value: T) => {
@@ -775,7 +812,10 @@ export function withReviewDeadline<T>(
 			rejectPromise(error);
 		};
 		const onParentAbort = () => rejectOnce(new AutoApproveReviewCancelledError());
-		const timer = setTimeout(() => rejectOnce(new AutoApproveReviewTimeoutError(ms)), ms);
+		const timer =
+			ms === REVIEW_TIMEOUT_UNLIMITED_MS
+				? undefined
+				: setTimeout(() => rejectOnce(new AutoApproveReviewTimeoutError(ms)), ms);
 		parentSignal?.addEventListener("abort", onParentAbort, { once: true });
 		if (parentSignal?.aborted) {
 			onParentAbort();
@@ -897,15 +937,14 @@ export default function autoApproveExtension(pi: ExtensionAPI) {
 	 * A configured override must resolve to an authenticated model or the
 	 * review fails closed; without an override the session's model reviews.
 	 */
-	function resolveReviewerModel(ctx: ExtensionContext): ReviewerModel | undefined {
-		const override = loadReviewerModelConfig();
-		if (override) {
-			const { provider, modelId } = override.model;
+	function resolveReviewerModel(ctx: ExtensionContext, loaded: LoadedReviewerConfig | undefined): ReviewerModel | undefined {
+		if (loaded?.config.model) {
+			const { provider, modelId } = loaded.config.model;
 			const label = `${provider}${REVIEWER_MODEL_SEPARATOR}${modelId}`;
 			const model = ctx.modelRegistry.find(provider, modelId);
-			if (!model) throw new Error(`${override.path}: reviewer model ${label} is not in pi's model registry`);
+			if (!model) throw new Error(`${loaded.path}: reviewer model ${label} is not in pi's model registry`);
 			if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
-				throw new Error(`${override.path}: reviewer model ${label} has no configured auth`);
+				throw new Error(`${loaded.path}: reviewer model ${label} has no configured auth`);
 			}
 			return model;
 		}
@@ -918,8 +957,14 @@ export default function autoApproveExtension(pi: ExtensionAPI) {
 		toolName: string,
 		input: unknown,
 	): Promise<AutoApproveAssessment> {
-		const model = resolveReviewerModel(ctx);
+		const loaded = loadReviewerConfig();
+		const model = resolveReviewerModel(ctx, loaded);
 		if (!model) throw new Error("no reviewer model with configured auth");
+		// One budget covers setup and every attempt (codex ReviewDeadline). The
+		// provider transport timeout is capped to it when finite and left at the
+		// provider default when the deadline is unlimited.
+		const reviewTimeoutMs = loaded?.config.timeoutMs ?? AUTO_APPROVE_REVIEW_TIMEOUT_MS;
+		const transportTimeoutMs = reviewTimeoutMs === REVIEW_TIMEOUT_UNLIMITED_MS ? undefined : reviewTimeoutMs;
 		// Codex additionally scales by the model's effective context-window
 		// percent; pi has no such field, so the full window applies.
 		const maxInputTokens = model.contextWindow > 0 ? model.contextWindow : DEFAULT_MAX_INPUT_TOKENS;
@@ -949,7 +994,7 @@ export default function autoApproveExtension(pi: ExtensionAPI) {
 								sessionId: reviewerSessionId,
 								signal,
 								maxRetries: 0,
-								timeoutMs: AUTO_APPROVE_REVIEW_TIMEOUT_MS,
+								timeoutMs: transportTimeoutMs,
 							},
 						);
 						if (response.stopReason === "aborted") throw new AutoApproveReviewCancelledError();
@@ -982,7 +1027,7 @@ export default function autoApproveExtension(pi: ExtensionAPI) {
 				}
 				throw lastError instanceof Error ? lastError : new Error(String(lastError));
 			},
-			AUTO_APPROVE_REVIEW_TIMEOUT_MS,
+			reviewTimeoutMs,
 			ctx.signal,
 		);
 	}
