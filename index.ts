@@ -327,6 +327,24 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
 }
 
 /**
+ * Authorization evidence revision (codex-rs/core/src/guardian/authorization.rs
+ * `user_message_revision`): changes whenever a user message is added to the
+ * active branch. Only user messages count; assistant and tool traffic cannot
+ * grant or revoke authorization, so it never invalidates a verdict.
+ */
+export function userAuthorizationRevision(ctx: ExtensionContext): string {
+	let count = 0;
+	let lastId = "";
+	const entries = ctx.sessionManager.getBranch() as Array<{ type: string; id?: string; message?: { role?: string } }>;
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message?.role !== "user") continue;
+		count += 1;
+		lastId = entry.id ?? "";
+	}
+	return `${count}:${lastId}`;
+}
+
+/**
  * How an item behaves under the whole-request budget (mirrors
  * codex-rs/guardian-context/src/enforcement.rs):
  *   required   - never shortened or dropped (policy, planned action, newest tools)
@@ -633,6 +651,18 @@ class AutoApproveVerdictParseError extends Error {
 	}
 }
 
+/**
+ * An allow verdict was reached against authorization evidence that changed
+ * while the reviewer ran (codex-rs/ext/guardian-reviewer/src/outcome.rs
+ * `StaleAuthorization`). The verdict is discarded and the review retried.
+ */
+export class AutoApproveStaleAuthorizationError extends Error {
+	constructor() {
+		super("authorization changed before approval could be applied");
+		this.name = "AutoApproveStaleAuthorizationError";
+	}
+}
+
 /** Run an operation under one abortable deadline, including any retries/backoff. */
 export function withReviewDeadline<T>(
 	operation: (signal: AbortSignal) => Promise<T>,
@@ -728,7 +758,7 @@ function reviewerErrorStatus(error: unknown): number | undefined {
  * value is not observable here and only exponential backoff applies.
  */
 function isRetryableReviewerError(error: unknown): boolean {
-	if (error instanceof AutoApproveVerdictParseError) return true;
+	if (error instanceof AutoApproveVerdictParseError || error instanceof AutoApproveStaleAuthorizationError) return true;
 	if (error instanceof AutoApproveReviewTimeoutError || error instanceof AutoApproveReviewCancelledError) return false;
 	const status = reviewerErrorStatus(error);
 	if (status !== undefined) return status === 408 || status === 429 || status >= 500;
@@ -807,20 +837,24 @@ export default function autoApproveExtension(pi: ExtensionAPI) {
 		// Codex additionally scales by the model's effective context-window
 		// percent; pi has no such field, so the full window applies.
 		const maxInputTokens = model.contextWindow > 0 ? model.contextWindow : DEFAULT_MAX_INPUT_TOKENS;
-		const prompt = buildReviewPrompt(ctx, toolName, input, maxInputTokens);
-		const messages = [
-			{
-				role: "user" as const,
-				content: [{ type: "text" as const, text: prompt }],
-				timestamp: Date.now(),
-			},
-		];
 
 		return await withReviewDeadline(
 			async (signal) => {
 				let lastError: unknown;
 				for (let attempt = 1; attempt <= AUTO_APPROVE_MAX_ATTEMPTS; attempt++) {
 					try {
+						// Every attempt captures the authorization revision and rebuilds
+						// the prompt from live history, so a retry judges the evidence as
+						// it stands now rather than a snapshot from the first attempt.
+						const revision = userAuthorizationRevision(ctx);
+						const prompt = buildReviewPrompt(ctx, toolName, input, maxInputTokens);
+						const messages = [
+							{
+								role: "user" as const,
+								content: [{ type: "text" as const, text: prompt }],
+								timestamp: Date.now(),
+							},
+						];
 						const response = await ctx.modelRegistry.complete(
 							model,
 							{ messages },
@@ -841,12 +875,22 @@ export default function autoApproveExtension(pi: ExtensionAPI) {
 							.map((c) => c.text)
 							.join("\n");
 						const verdict = parseVerdict(text);
-						if (verdict) return verdict;
-						throw new AutoApproveVerdictParseError(text);
+						if (!verdict) throw new AutoApproveVerdictParseError(text);
+						// An allow is valid only for the authorization it was judged
+						// against: a user message that arrived mid-review may have revoked
+						// or narrowed it. Denials stand regardless (codex review_session_setup.rs).
+						if (verdict.outcome === "allow" && userAuthorizationRevision(ctx) !== revision) {
+							throw new AutoApproveStaleAuthorizationError();
+						}
+						return verdict;
 					} catch (error) {
 						lastError = error;
 						if (attempt >= AUTO_APPROVE_MAX_ATTEMPTS || !isRetryableReviewerError(error)) break;
-						await abortableSleep(reviewerRetryDelayMs(attempt), signal);
+						// Stale authorization is a local evidence refresh, not a failed
+						// service request: skip the backoff and only yield so cancellation
+						// and the deadline can run before capturing evidence again.
+						const stale = error instanceof AutoApproveStaleAuthorizationError;
+						await abortableSleep(stale ? 0 : reviewerRetryDelayMs(attempt), signal);
 					}
 				}
 				throw lastError instanceof Error ? lastError : new Error(String(lastError));

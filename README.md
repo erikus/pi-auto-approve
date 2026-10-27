@@ -52,7 +52,11 @@ Set `PI_AUTO_APPROVE_LOG=/path/to/file` to append one JSON line per review.
    (optional evidence is evicted first, user messages are shortened only as a last
    resort, and an omission notice tells the reviewer not to infer authorization from
    missing evidence), and asks for a strict-JSON verdict
-   `{risk_level, user_authorization, outcome, rationale}` per the policy prompt.
+   `{risk_level, user_authorization, outcome, rationale}` per the policy prompt. An
+   `allow` is applied only if no new user message arrived while the reviewer ran;
+   otherwise it is discarded and the review is redone immediately against the current
+   transcript, within the same attempt budget and deadline (mirroring Codex's
+   stale-authorization retry). Denials stand regardless.
 3. **Deny** blocks the tool call with instructions to the agent not to work around the
    denial (mirroring Codex). In the TUI you get an "Allow anyway?" override prompt - a manual approval is final, like Codex's post-denial user approval.
 4. **Fail closed**: timeout (one 90s deadline shared by all attempts), unparseable
