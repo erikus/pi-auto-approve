@@ -36,6 +36,9 @@ const AUTO_APPROVE_REVIEW_TIMEOUT_MS = 90_000;
 // `[auto_review] timeout_ms = 0`); cancellation, the attempt limit, and the
 // provider's own transport timeout still apply.
 const REVIEW_TIMEOUT_UNLIMITED_MS = 0;
+// Largest delay Node's setTimeout honors (2^31 - 1 ms, ~24.8 days); anything
+// larger silently becomes 1 ms, so a configured timeoutMs above it is rejected.
+const MAX_REVIEW_TIMEOUT_MS = 2_147_483_647;
 const AUTO_APPROVE_MAX_ATTEMPTS = 3;
 // Retry classification mirrors codex-rs/ext/guardian-reviewer/src/retry.rs
 // `should_retry_guardian_review`, mapped onto the messages pi's providers
@@ -231,9 +234,14 @@ export function parseReviewerConfig(text: string, path: string): ReviewerConfig 
 	}
 	const config: ReviewerConfig = {};
 	if (timeoutMs !== undefined) {
-		if (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < REVIEW_TIMEOUT_UNLIMITED_MS) {
+		if (
+			typeof timeoutMs !== "number" ||
+			!Number.isInteger(timeoutMs) ||
+			timeoutMs < REVIEW_TIMEOUT_UNLIMITED_MS ||
+			timeoutMs > MAX_REVIEW_TIMEOUT_MS
+		) {
 			throw new Error(
-				`${path}: "timeoutMs" must be a non-negative integer number of milliseconds (${REVIEW_TIMEOUT_UNLIMITED_MS} disables the deadline), got ${JSON.stringify(timeoutMs)}`,
+				`${path}: "timeoutMs" must be an integer number of milliseconds from ${REVIEW_TIMEOUT_UNLIMITED_MS} to ${MAX_REVIEW_TIMEOUT_MS} (${REVIEW_TIMEOUT_UNLIMITED_MS} disables the deadline), got ${JSON.stringify(timeoutMs)}`,
 			);
 		}
 		config.timeoutMs = timeoutMs;
