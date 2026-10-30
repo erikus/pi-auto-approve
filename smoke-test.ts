@@ -83,6 +83,7 @@ assert.equal(parseVerdict("I think this is fine."), undefined);
 	});
 	assert.deepEqual(parseReviewerConfig('{"timeoutMs": 120000}', path), { timeoutMs: 120_000 });
 	assert.deepEqual(parseReviewerConfig('{"timeoutMs": 0}', path), { timeoutMs: 0 }, "0 means no deadline");
+	assert.deepEqual(parseReviewerConfig('{"timeoutMs": 2147483647}', path), { timeoutMs: 2_147_483_647 }, "setTimeout's max");
 	assert.deepEqual(parseReviewerConfig('{"model":"anthropic/claude-opus-5","timeoutMs":5000}', path), {
 		model: { provider: "anthropic", modelId: "claude-opus-5" },
 		timeoutMs: 5_000,
@@ -100,6 +101,7 @@ assert.equal(parseVerdict("I think this is fine."), undefined);
 		'{"timeoutMs": 1.5}',
 		'{"timeoutMs": "90000"}',
 		'{"timeoutMs": null}',
+		'{"timeoutMs": 3000000000}',
 	]) {
 		assert.throws(() => parseReviewerConfig(body, path), new RegExp(`^Error: ${path}: `), body);
 	}

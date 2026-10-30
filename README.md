@@ -95,8 +95,9 @@ first `/`, so OpenRouter-style ids like `openrouter/anthropic/claude-opus-5` wor
 model must exist in pi's model registry and have configured auth.
 
 `timeoutMs` (Codex's `[auto_review] timeout_ms`): the whole review's budget in
-milliseconds, as a non-negative integer. `0` disables the deadline; cancellation, the
-three-attempt limit, and the provider's own transport timeout still apply.
+milliseconds, as an integer from 0 to 2147483647 (~24.8 days, Node's timer limit). `0`
+disables the deadline; cancellation, the three-attempt limit, and the provider's own
+transport timeout still apply.
 
 A malformed file, an unknown model, or a model without auth is a configuration error:
 gated actions fail closed with a message naming the file, rather than silently falling
